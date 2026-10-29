@@ -43,7 +43,10 @@ const session = await joinSession({
             action("apply_scope", "Apply and persist a server-side scope within the selected project, then load its first 100 items. Empty input applies the draft.", schema(scopeSchema.properties, []), (w, input) => w.applyScope(input?.kind ? input : undefined)),
             action("load_more", "Load the next working-set page using Jira's continuation; preserve loaded data on failure.", schema(), w => w.loadMore()),
             action("load_children", "Explicitly load the next page of an item's immediate children, as context only; never crawl their siblings or descendants.", schema({ nodeId: string }), (w, input) => w.loadChildren(input)),
-            action("set_visible_items", "Bound periodic execution evidence reads to at most 100 visible or selected loaded item IDs.", schema({ workingSetKey: string, nodeIds: { type: "array", maxItems: 100, items: string } }), (w, input) => w.setVisible(input)),
+            action("set_visible_items", "Bound periodic execution evidence reads to visible or selected items. Use workingSetGeneration from get_state and an increasing revision.", schema({
+                workingSetKey: string, generation: { type: "integer", minimum: 0 }, revision: { type: "integer", minimum: 1 },
+                nodeIds: { type: "array", maxItems: 100, items: string },
+            }), (w, input) => w.setVisible(input)),
             action("configure_repository", "Save the separate Copilot repository mapping for the selected Jira project.", schema({ copilotProjectId: string }), (w, input) => w.map(input)),
             action("refresh", "Refresh Jira hierarchy; preserve but mark stale data on failure.", schema(), w => w.refresh({ fresh: true })),
             action("refresh_execution", "Reconcile linked session intervention signals and GitHub evidence for this project.", schema({ source: { type: "string", enum: ["all", "sessions", "github"] } }, []), (w, input) => w.refreshExecution(input)),

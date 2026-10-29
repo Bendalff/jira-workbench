@@ -132,6 +132,62 @@ test("launch requires preview and confirmation; duplicate clicks create one requ
     assert.equal(result.status, "queued");
 });
 
+test("launch rechecks preview membership inside the persistence transaction after a page append", async t => {
+    const { workbench, store, gateway, sent } = await fixture(t);
+    await workbench.map({ copilotProjectId: copilot.id });
+    const preview = await workbench.prepare({ nodeId: "1", mode: "plan" });
+    const original = store.update.bind(store);
+    store.update = async change => {
+        workbench.page.nextPageToken = "next";
+        gateway.issues = async () => ({ issues: [{ ...rows[1], id: "3", key: "DEMO-3" }], fetchedAt: "next" });
+        await workbench.loadMore();
+        return original(change);
+    };
+    await assert.rejects(confirm(workbench, preview), /preview was invalidated/);
+    assert.equal(sent.length, 0);
+    assert.deepEqual((await store.read()).requests, {});
+});
+
+test("project sync includes durable unloaded evidence but not foreign workflow statuses", async t => {
+    const { workbench, store, gateway, sent } = await fixture(t);
+    await workbench.map({ copilotProjectId: copilot.id });
+    await workbench.linkSession({ nodeId: "2", sessionId: "session-1" });
+    workbench.issues = [rows[0], { ...rows[1], id: "9", projectId: "43", key: "FOREIGN-9", status: "Foreign workflow", contextOnly: true }];
+    gateway.lookupIssues = async (cloudId, projectId, ids) => {
+        assert.equal(projectId, "42");
+        assert.deepEqual(ids, ["2"]);
+        return [rows[1]];
+    };
+    const snapshot = await workbench.snapshot();
+    assert.ok(!snapshot.statuses.some(status => status.name === "Foreign workflow"));
+    await workbench.syncJira();
+    const kickoff = JSON.parse(sent[0].prompt.split("\n\n").find(part => part.includes('"kickoff"'))).kickoff.prompt;
+    assert.match(kickoff, /"key": "DEMO-2"/);
+    assert.match(kickoff, /"name": "Implementation"/);
+    assert.match(kickoff, /No linked issues were omitted/);
+    assert.doesNotMatch(kickoff, /Foreign workflow/);
+    assert.equal(Object.keys((await store.read()).links).length, 1);
+});
+
+test("project sync reports unresolved and over-limit durable evidence without claiming completeness", async t => {
+    const { workbench, store, gateway, sent } = await fixture(t);
+    await workbench.map({ copilotProjectId: copilot.id });
+    await store.update(data => {
+        for (let id = 100; id < 405; id++) data.links[workbench.selectedScope(String(id))] = { sessions: [{ name: "Unloaded active work" }], prs: [] };
+    });
+    let requested = 0;
+    gateway.lookupIssues = async (cloudId, projectId, ids) => {
+        requested = ids.length;
+        throw new Error("Identity lookup unavailable");
+    };
+    await workbench.syncJira();
+    assert.equal(requested, 300);
+    const kickoff = JSON.parse(sent[0].prompt.split("\n\n").find(part => part.includes('"kickoff"'))).kickoff.prompt;
+    assert.match(kickoff, /305 linked issue\(s\) were omitted/);
+    assert.match(kickoff, /Identity lookup unavailable/);
+    assert.doesNotMatch(kickoff, /No linked issues were omitted/);
+});
+
 
 test("receipt persists actual session and PR without changing Jira status or losing earlier sessions", async t => {
     const { workbench, store, sent, githubReads } = await fixture(t);

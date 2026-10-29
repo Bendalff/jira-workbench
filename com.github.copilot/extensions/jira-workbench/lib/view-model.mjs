@@ -1,6 +1,6 @@
 // Pure view-model helpers for the panel: every input is explicit, with no DOM and no node: imports.
 // The server serves this file as /view-model.mjs next to /model.mjs, which it imports.
-import { REQUEST_TTL_MS, jiraFreshness, requestStatus } from "./model.mjs";
+import { REQUEST_TTL_MS, jiraFreshness, requestStatus, issueIndex, issueParent } from "./model.mjs";
 
 export const humanize = value => String(value || "unknown").replace(/[_-]/g, " ");
 
@@ -196,13 +196,13 @@ export function filterTree(roots, query = "", category = "all", sprint = "all") 
 // Distinct linked session IDs among each issue's descendants (as model.mjs descendants() defines them), for every
 // issue at once: one key index, then each linked issue walks up its own ancestors. Parent cycles stop at a repeat.
 export function descendantSessionCounts(issues, sessionIdsFor) {
-    const byKey = new Map(issues.map(issue => [issue.key, issue]));
+    const byKey = issueIndex(issues);
     const found = new Map();
     for (const issue of issues) {
         const ids = sessionIdsFor(issue.id);
         if (!ids.length) continue;
         const seen = new Set([issue.key]);
-        for (let parent = byKey.get(issue.parentKey); parent && !seen.has(parent.key); parent = byKey.get(parent.parentKey)) {
+        for (let parent = issueParent(issue, byKey); parent && !seen.has(parent.key); parent = issueParent(parent, byKey)) {
             seen.add(parent.key);
             if (!found.has(parent.id)) found.set(parent.id, new Set());
             for (const id of ids) found.get(parent.id).add(id);

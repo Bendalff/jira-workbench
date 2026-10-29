@@ -183,6 +183,43 @@ test("missing completion metadata and unsupported child results fail explicitly"
     await assert.rejects(unknown.issuePage("site-a", "project = 42"), /completion|continuation/);
 });
 
+test("explicit final cursor pages win over total/offset and stale continuation metadata", async () => {
+    const gateway = new Gateway(runtime(() => ({
+        issues: [issue("150", "DEMO-150")], isLast: true, total: 150, nextPageToken: "last",
+    })));
+    const page = await gateway.issuePage("site-a", "project = 42", { cursor: "last" });
+    assert.equal(page.issues.length, 1);
+    assert.equal(page.nextPageToken, null);
+    assert.equal(page.total, 150);
+});
+
+test("ancestor paging walks only new seeds and remembers missing references within a generation", async () => {
+    let calls = 0;
+    const gateway = new Gateway(runtime((name, args) => {
+        calls++;
+        assert.doesNotMatch(args.jql, /MISSING-1.*MISSING-2/);
+        return { issues: [], isLast: true };
+    }));
+    const first = normalize(issue("1", "DEMO-1", "MISSING-1"));
+    const a = await gateway.ancestors("site-a", [first]);
+    const b = await gateway.ancestors("site-a", [normalize(issue("2", "DEMO-2", "MISSING-2"))], { existing: [first], attemptedParents: a.attemptedParents });
+    await gateway.ancestors("site-a", [first], { attemptedParents: b.attemptedParents });
+    assert.equal(calls, 2, "previous missing parents are not retried on each new page");
+});
+
+test("durable issue identity reads stay bounded and constrained to the selected project", async () => {
+    let calls = 0;
+    const gateway = new Gateway(runtime((name, args) => {
+        calls++;
+        assert.match(args.jql, /^project = 42 AND id in/);
+        assert.ok(args.jql.match(/,/g)?.length < 50 || !args.jql.includes(","));
+        return { issues: [], isLast: true };
+    }));
+    await gateway.lookupIssues("site-a", "42", Array.from({ length: 123 }, (_, i) => String(i + 1)));
+    assert.equal(calls, 3);
+    await assert.rejects(gateway.lookupIssues("site-a", "42", ["bad"]), /numeric/);
+});
+
 
 test("project picker paginates independently from issue pagination", async () => {
     const gateway = new Gateway(runtime((name, args) => ({

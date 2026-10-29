@@ -28,7 +28,7 @@ const initialPreferenceEdits = new Set();
 const disclosures = new Map(), linkDrafts = new Map(), submittedPreviews = new Set();
 const connectionMessages = new Map();
 const executionRefreshes = new Map();
-let visibleTimer, visibleSignature = "";
+let visibleTimer, visibleSignature = "", visibleRevision = 0;
 const visibleIds = new Set();
 const visibleObserver = new IntersectionObserver(entries => {
     for (const entry of entries) {
@@ -40,15 +40,18 @@ const visibleObserver = new IntersectionObserver(entries => {
 
 function queueVisibleItems() {
     clearTimeout(visibleTimer);
-    const key = state.workingSetKey, epoch = scopeEpoch;
+    const key = state.workingSetKey, epoch = scopeEpoch, generation = state.workingSetGeneration;
     if (!key || selecting) return;
     visibleTimer = setTimeout(async () => {
         const nodeIds = [...new Set([ui.selected, ...visibleIds].filter(Boolean))].slice(0, 100);
-        const signature = JSON.stringify([key, nodeIds]);
+        const signature = JSON.stringify([key, generation, epoch, nodeIds]);
         if (signature === visibleSignature || epoch !== scopeEpoch) return;
         try {
-            await api("visible", { workingSetKey: key, nodeIds });
-            if (epoch === scopeEpoch) { visibleSignature = signature; connectionMessage("visible", ""); }
+            const revision = ++visibleRevision;
+            await api("visible", { workingSetKey: key, generation, revision, nodeIds });
+            if (epoch === scopeEpoch && generation === state.workingSetGeneration && revision === visibleRevision) {
+                visibleSignature = signature; connectionMessage("visible", "");
+            }
         } catch (error) {
             if (epoch === scopeEpoch) connectionMessage("visible", `Visible-item evidence selection could not be saved: ${error.message}`);
         }
@@ -89,9 +92,11 @@ const actionKey = (kind, target, scope = state.scope) => JSON.stringify([scope |
 const jiraUrl = key => `${state.site.url}/browse/${encodeURIComponent(key)}`;
 const itemUrl = item => item.id === "project" ? `${state.site.url}/jira/software/projects/${encodeURIComponent(state.project.key)}/summary` : jiraUrl(item.key);
 function nodeLinks(id) {
+    if (foreignContext(getItem(id))) return { sessions: [], prs: [] };
     const trace = state.site && state.project ? state.links[scopeKey(state.site.id, state.project.id, id)] : null;
     return { sessions: [], prs: [], ...trace };
 }
+const foreignContext = item => Boolean(item?.projectId && item.projectId !== state.project?.id);
 function setSource(element, text, tone, detail) {
     element.textContent = text;
     element.dataset.tone = tone;
@@ -125,12 +130,14 @@ async function api(path, input, signal) {
     }
     return result;
 }
-async function loadPageAction(path, input) {
+async function loadPageAction(path, input, context) {
+    const generation = state.workingSetGeneration;
+    const version = ++snapshotVersion;
     const snapshot = await api(path, input);
-    if (snapshot.pageError) {
-        acceptSnapshot(snapshot);
-        throw new Error(snapshot.pageError);
-    }
+    if (!context.current() || generation !== state.workingSetGeneration) return snapshot;
+    if (snapshot.workingSetGeneration !== generation || snapshot.pageResult?.status === "superseded") return snapshot;
+    if (version === snapshotVersion) acceptSnapshot(snapshot);
+    if (snapshot.pageResult?.error) throw new Error(snapshot.pageResult.error);
     return snapshot;
 }
 function refreshExecution(source = "all", epoch = scopeEpoch, afterCurrent = false) {
@@ -268,6 +275,8 @@ function acceptSnapshot(snapshot, { allowScopeChange = false } = {}) {
     }
     if (preview && state.mapping?.id !== snapshot.mapping?.id) markPreviewDirty();
     state = { ...snapshot, executions: snapshot.executions || [], navigationReceipts: snapshot.navigationReceipts || [] };
+    visibleRevision = Math.max(visibleRevision, snapshot.visibilityRevision || 0);
+    queueVisibleItems();
     reconcileReceipts();
     render({ force: changedScope });
     updateLaunchControls();
@@ -301,6 +310,7 @@ function updateActionControl(control) {
 }
 function actionButton(text, kind, target, nodeId, work, options = {}) {
     const b = button(text, () => void perform({ kind, target, nodeId, label: text, work, ...options }), options.className);
+    b.dataset.focusKey = `action:${kind}:${target}`;
     return configureActionControl(b, kind, target, options.disabled);
 }
 async function perform({ kind, target, nodeId, label, work, success, refresh = false, global = false, previewId }) {
@@ -310,6 +320,8 @@ async function perform({ kind, target, nodeId, label, work, success, refresh = f
     if ((selecting || !scopeConfirmed || standaloneHost(state)) && !global) return;
     if (kind === "prepare" && nodePending(nodeId)) return;
     const record = { kind, scope, nodeId, previewId, status: "pending", message: `${label}...`, dismissed: false };
+    const paging = ["children", "load-more"].includes(kind);
+    const restorePagingFocus = paging && document.activeElement?.dataset.actionKey === key;
     actions.set(key, record);
     paintFeedback();
     try {
@@ -348,6 +360,13 @@ async function perform({ kind, target, nodeId, label, work, success, refresh = f
         }
         paintFeedback();
         updateLaunchControls();
+        if (restorePagingFocus && scope === state.scope && epoch === scopeEpoch && !selecting
+            && (document.activeElement === document.body || document.activeElement?.disabled)) {
+            renderTree(true);
+            const control = [...document.querySelectorAll("[data-action-key]")].find(element => element.dataset.actionKey === key && !element.disabled && !element.hidden);
+            if (control) control.focus({ preventScroll: true });
+            else if (!focusRow(nodeId) && !focusRow(focusedNode)) $("search").focus({ preventScroll: true });
+        }
     }
 }
 function reconcileReceipts() {
@@ -464,7 +483,7 @@ function render({ force = false } = {}) {
     selectOptions($("repository"), state.appProjects.map(p => ({ value: p.id, label: p.repo || p.name })), state.mapping?.id, "Choose a Copilot repository");
     renderStatusFilter();
     renderSprintFilter();
-    const scopeSignature = JSON.stringify(state.scopeDraft);
+    const scopeSignature = JSON.stringify([state.scope, state.scopeDraft]);
     if ($("scope-kind").dataset.signature !== scopeSignature) {
         $("scope-kind").dataset.signature = scopeSignature;
         $("scope-kind").value = state.scopeDraft?.kind || "project";
@@ -472,7 +491,9 @@ function render({ force = false } = {}) {
     }
     $("scope-value").disabled = $("scope-kind").value === "project" || selecting || !state.project;
     $("scope-kind").disabled = $("apply-scope").disabled = selecting || !state.project;
-    $("scope-summary").textContent = state.project ? workingSetSummary(state) : "Choose a project to load a working set.";
+    $("apply-scope").setAttribute("aria-busy", String(selecting));
+    const scopeSummary = state.project ? workingSetSummary(state) : "Choose a project to load a working set.";
+    if ($("scope-summary").textContent !== scopeSummary) $("scope-summary").textContent = scopeSummary;
     $("load-more").hidden = !state.page?.nextPageToken;
     configureActionControl($("load-more"), "load-more", "working-set", selecting || !state.project);
     configureActionControl($("project-start"), "prepare", "project", !state.project || !state.mapping || state.cached);
@@ -759,7 +780,7 @@ function renderTree(force = false) {
             if (childLabel) {
                 const childPage = state.childPages?.[item.id];
                 name.append(actionButton(childLabel, "children", item.id, item.id,
-                    () => loadPageAction("children", { nodeId: item.id }), {
+                    context => loadPageAction("children", { nodeId: item.id }, context), {
                         className: "child-load", disabled: Boolean(childPage && !childPage.nextPageToken),
                         refresh: true, success: "Child page loaded as context only.",
                     }));
@@ -1003,6 +1024,10 @@ function traceStep(container, number, title) {
     return step;
 }
 function renderTrace(body, item) {
+    if (foreignContext(item)) {
+        body.append(el("p", "Select this item's own Jira project to view, link or refresh its Copilot trace. Cross-project context does not use this project's repository mapping.", "muted"));
+        return;
+    }
     const traces = nodeLinks(item.id), bar = el("div", null, "trace-toolbar");
     bar.append(el("span", traces.verifiedAt ? `Trace checked ${time(traces.verifiedAt)}` : "Links not refreshed yet", "muted"),
         actionButton("Refresh trace", "trace", item.id, item.id, () => api("trace", { nodeId: item.id }), { refresh: true, success: "Trace refresh returned; see source freshness below." }));
@@ -1308,22 +1333,31 @@ function selectProject(cloudId, jiraProjectId) {
 $("scope-kind").addEventListener("change", () => { $("scope-value").disabled = $("scope-kind").value === "project"; });
 $("apply-scope").addEventListener("click", async () => {
     if (selecting || !state.project) return;
+    const restoreFocus = document.activeElement === $("apply-scope");
+    const definition = { kind: $("scope-kind").value, value: $("scope-value").value };
     closePreview();
     selecting = true;
     const epoch = ++scopeEpoch;
     snapshotVersion++;
+    connectionMessage("apply-scope", "Applying scope; reading the first Jira page.");
     render();
     try {
-        const snapshot = await api("scope", { kind: $("scope-kind").value, value: $("scope-value").value });
-        if (epoch === scopeEpoch) { acceptSnapshot(snapshot); connectionMessage("apply-scope", ""); }
+        const snapshot = await api("scope", definition);
+        if (epoch === scopeEpoch) {
+            acceptSnapshot(snapshot);
+            connectionMessage("apply-scope", snapshot.pageError?.startsWith("Scope was not applied:") ? snapshot.pageError : "Scope applied.");
+        }
     } catch (error) {
         if (epoch === scopeEpoch) connectionMessage("apply-scope", `Scope was not applied: ${error.message}`);
     } finally {
-        if (epoch === scopeEpoch) { selecting = false; render({ force: true }); queueVisibleItems(); }
+        if (epoch === scopeEpoch) {
+            selecting = false; render({ force: true }); queueVisibleItems();
+            if (restoreFocus && document.activeElement === document.body) $("apply-scope").focus({ preventScroll: true });
+        }
     }
 });
 $("load-more").addEventListener("click", () => void perform({
-    kind: "load-more", target: "working-set", label: "Load more", work: () => loadPageAction("load-more", {}), refresh: true,
+    kind: "load-more", target: "working-set", label: "Load more", work: context => loadPageAction("load-more", {}, context), refresh: true,
     success: "Working-set page loaded.",
 }));
 $("search").addEventListener("input", () => { ui.query = $("search").value; savePreferences("query"); renderExecutionFilters(); renderTree(true); paintFeedback(); });

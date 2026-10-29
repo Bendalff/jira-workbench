@@ -3,7 +3,7 @@ import { deriveExecution } from "./execution.mjs";
 import { Launches } from "./launches.mjs";
 import { objects, settle, standaloneError } from "./runtime.mjs";
 import { Trace } from "./trace.mjs";
-import { DEFAULT_SCOPE, mergeIssues, validateScope, workingSetKey } from "./scope.mjs";
+import { DEFAULT_SCOPE, mergeIssues, validateScope, workingSetKey, scopeJql } from "./scope.mjs";
 
 export class Workbench {
     constructor(options) {
@@ -20,6 +20,9 @@ export class Workbench {
         this.pageLoads = new Map();
         this.ancestorWarnings = [];
         this.pageError = null;
+        this.pageErrors = {};
+        this.attemptedParents = [];
+        this.visibilityRevision = 0;
         this.refreshGeneration = 0;
         this.evidenceNodes = null;
         // The selected project's workflow statuses as Jira listed them; empty when it could not.
@@ -51,7 +54,10 @@ export class Workbench {
         this.childPages = {};
         this.ancestorWarnings = [];
         this.pageError = null;
+        this.pageErrors = {};
+        this.attemptedParents = [];
         this.evidenceNodes = null;
+        this.visibilityRevision = 0;
         this.previews.clear();
         this.fetchedAt = null;
         this.error = null;
@@ -274,6 +280,12 @@ export class Workbench {
         if (!node) throw new Error("That issue is not in the loaded project. Refresh before acting.");
         return node;
     }
+    traceNode(nodeId) {
+        const node = this.node(nodeId);
+        if (node.projectId && node.projectId !== this.project.id)
+            throw new Error("Select this context item's own Jira project to link or refresh its trace.");
+        return node;
+    }
     async map({ copilotProjectId }) {
         const key = this.selectedScope();
         const mapping = this.appProjects.find(p => p.id === copilotProjectId);
@@ -307,10 +319,12 @@ export class Workbench {
             projects: this.site ? this.projectLists.get(this.site.id) || [] : [],
             issues: this.issues, tree: buildTree(this.issues),
             workingScope: this.workingScope, scopeDraft: this.scopeDraft, workingSetKey: this.site && this.project ? this.loadKey() : null,
-            page: this.page, childPages: this.childPages, pageError: this.pageError,
+            page: this.page, childPages: this.childPages, pageError: Object.values(this.pageErrors).join("\n") || null,
             jiraRefreshing: Boolean(this.jiraRefreshing),
+            workingSetGeneration: this.refreshGeneration,
+            visibilityRevision: this.visibilityRevision,
             ancestorWarnings: this.ancestorWarnings, loadingPages: [...this.pageLoads.keys()],
-            statuses: this.site && this.project ? projectStatuses(this.statuses, this.issues) : [],
+            statuses: this.site && this.project ? projectStatuses(this.statuses, this.issues.filter(issue => issue.projectId === this.project.id)) : [],
             mapping, links, requests, executions,
             preferences: this.site && this.project ? data.preferences?.[this.selectedScope()] || {} : {},
             navigationReceipts: this.hostActions?.snapshot?.() || [],
@@ -326,21 +340,32 @@ export class Workbench {
     }
     async applyScope(input = this.scopeDraft) {
         const definition = validateScope(input), scope = this.selectedScope();
+        scopeJql(this.project.id, definition);
+        const cloudId = this.site.id, projectId = this.project.id;
         const generation = ++this.refreshGeneration;
+        const current = () => generation === this.refreshGeneration && scope === this.currentScope();
+        this.visibilityRevision = 0;
+        this.evidenceNodes = null;
         this.jiraRefreshing = generation;
         try {
+            const result = await this.readWorkingSet(cloudId, projectId, definition, true);
+            if (!current()) return this.snapshot();
             await this.store.update(data => {
+                if (!current()) return;
                 data.preferences ||= {};
                 data.preferences[scope] = { ...data.preferences[scope], workingScope: definition };
             });
+            if (!current()) return this.snapshot();
+            this.workingScope = definition;
+            this.scopeDraft = { ...definition };
+            this.installWorkingSet(result);
+            await this.saveWorkingSet();
+        } catch (error) {
+            if (current()) this.pageErrors.scope = `Scope was not applied: ${error.message}. Previous scope and loaded data retained.`;
         } finally {
             if (this.jiraRefreshing === generation) this.jiraRefreshing = null;
         }
-        if (generation !== this.refreshGeneration || scope !== this.currentScope()) return this.snapshot();
-        this.workingScope = definition;
-        this.scopeDraft = { ...definition };
-        this.resetWorkingSet();
-        return this.refresh({ fresh: true });
+        return this.snapshot();
     }
     async saveWorkingSet() {
         const key = this.loadKey(), cloudId = this.site.id, jiraProjectId = this.project.id;
@@ -353,10 +378,32 @@ export class Workbench {
             data.lastScope = { cloudId, jiraProjectId };
         });
     }
-    async withAncestors(cloudId, seeds, existing, options) {
-        if (!this.gateway.ancestors) return { issues: seeds, warnings: [] };
-        const parents = await this.gateway.ancestors(cloudId, mergeIssues(existing, seeds), options);
-        return { issues: mergeIssues(seeds, parents.issues), warnings: parents.warnings };
+    async withAncestors(cloudId, seeds, existing, options, attemptedParents = []) {
+        if (!this.gateway.ancestors) return { issues: seeds, warnings: [], attemptedParents };
+        const parents = await this.gateway.ancestors(cloudId, seeds, { ...options, existing, attemptedParents });
+        return { issues: mergeIssues(seeds, parents.issues), warnings: parents.warnings, attemptedParents: parents.attemptedParents || attemptedParents };
+    }
+    async readWorkingSet(cloudId, projectId, definition, fresh) {
+        return this.jira(async options => {
+            const read = await this.gateway.issues(cloudId, projectId, { ...options, scope: definition });
+            const context = await this.withAncestors(cloudId, read.issues, [], options);
+            const statuses = this.gateway.statuses ? await this.gateway.statuses(cloudId, projectId, options).catch(() => null) : null;
+            return { ...read, ...context, loaded: read.issues.length, statuses };
+        }, fresh);
+    }
+    installWorkingSet(result) {
+        this.issues = result.issues;
+        this.page = { nextPageToken: result.nextPageToken || null, total: result.total ?? null, loaded: result.loaded, cursors: [] };
+        this.childPages = {};
+        this.ancestorWarnings = result.warnings;
+        this.attemptedParents = result.attemptedParents;
+        this.pageError = null;
+        this.pageErrors = {};
+        this.previews.clear();
+        this.statuses = result.statuses || [];
+        this.fetchedAt = result.fetchedAt;
+        this.error = null;
+        this.cached = false;
     }
     async savePreferences({ scope, preferences }) {
         if (scope !== this.selectedScope()) throw new Error("The project scope changed; preferences were not saved.");
@@ -386,29 +433,14 @@ export class Workbench {
         const generation = this.refreshGeneration = (this.refreshGeneration || 0) + 1;
         const definition = this.workingScope;
         const current = () => generation === this.refreshGeneration && this.currentScope() && scope === this.loadKey();
+        this.visibilityRevision = 0;
+        this.evidenceNodes = null;
         this.jiraRefreshing = generation;
         try {
             const { id: cloudId } = this.site, { id: projectId } = this.project;
-            const result = await this.jira(async options => {
-                const read = await this.gateway.issues(cloudId, projectId, { ...options, scope: definition });
-                const context = await this.withAncestors(cloudId, read.issues, [], options);
-                // Only after the issues answered, so a dead token still costs one call. Optional: without the
-                // workflow listing, statuses seen on issues still show.
-                const statuses = this.gateway.statuses ? await this.gateway.statuses(cloudId, projectId, options).catch(() => null) : null;
-                return { ...read, ...context, loaded: read.issues.length, statuses };
-            }, fresh);
+            const result = await this.readWorkingSet(cloudId, projectId, definition, fresh);
             if (!current()) return this.snapshot();
-            this.issues = result.issues;
-            this.page = { nextPageToken: result.nextPageToken || null, total: result.total ?? null, loaded: result.loaded, cursors: [] };
-            this.childPages = {};
-            this.ancestorWarnings = result.warnings;
-            this.pageError = null;
-            this.previews.clear();
-            // No listing this time: drop any earlier one rather than present it as current; issue statuses still show.
-            this.statuses = result.statuses || [];
-            this.fetchedAt = result.fetchedAt;
-            this.error = null;
-            this.cached = false;
+            this.installWorkingSet(result);
             await this.saveWorkingSet();
         } catch (error) {
             if (current()) this.error = error.message;
@@ -436,17 +468,19 @@ export class Workbench {
         const { id: cloudId } = this.site, { id: projectId } = this.project;
         const definition = this.workingScope, before = parent ? this.childPages[parent.id] : this.page;
         const existing = this.issues;
+        const attemptedParents = this.attemptedParents;
         const cursor = before?.nextPageToken || null;
         const current = () => generation === this.refreshGeneration && this.currentScope() && key === this.loadKey();
         const pending = (async () => {
+            let outcome = { target, status: "superseded", error: null };
             try {
                 const result = await this.jira(async options => {
                     const read = parent ? await this.gateway.children(cloudId, parent, { ...options, cursor })
                         : await this.gateway.issues(cloudId, projectId, { ...options, scope: definition, cursor });
                     const seeds = read.issues.map(issue => parent ? { ...issue, contextOnly: true, expandedChild: true } : issue);
-                    return { ...read, ...await this.withAncestors(cloudId, seeds, existing, options), loadedIds: read.issues.map(issue => issue.id) };
+                    return { ...read, ...await this.withAncestors(cloudId, seeds, existing, options, attemptedParents), loadedIds: read.issues.map(issue => issue.id) };
                 }, true);
-                if (!current()) return this.snapshot();
+                if (!current()) return { ...await this.snapshot(), pageResult: outcome };
                 if (result.nextPageToken && [cursor, ...(before?.cursors || [])].includes(result.nextPageToken))
                     throw new Error("Jira pagination repeated a cursor; loaded data was preserved.");
                 this.issues = mergeIssues(this.issues, result.issues);
@@ -457,23 +491,36 @@ export class Workbench {
                 if (parent) this.childPages = { ...this.childPages, [parent.id]: page };
                 else this.page = page;
                 this.ancestorWarnings = [...new Set([...this.ancestorWarnings, ...result.warnings])];
-                this.pageError = null;
+                delete this.pageErrors[target];
+                this.pageError = Object.values(this.pageErrors).join("\n") || null;
+                this.attemptedParents = [...new Set([...this.attemptedParents, ...result.attemptedParents])];
                 this.previews.clear();
                 await this.saveWorkingSet();
+                if (current()) outcome = { target, status: "loaded", error: null };
             } catch (error) {
-                if (current()) this.pageError = `${parent ? `Children of ${parent.key}` : "Load more"}: ${error.message}`;
+                if (current()) {
+                    const message = `${parent ? `Children of ${parent.key}` : "Load more"}: ${error.message}`;
+                    this.pageErrors[target] = message;
+                    this.pageError = Object.values(this.pageErrors).join("\n");
+                    outcome = { target, status: "failed", error: message };
+                }
             }
-            return this.snapshot();
+            return { ...await this.snapshot(), pageResult: outcome };
         })();
         this.pageLoads.set(flightKey, pending);
         try { return await pending; }
         finally { this.pageLoads.delete(flightKey); }
     }
-    async setVisible({ nodeIds, workingSetKey: key }) {
-        if (key !== this.loadKey()) throw new Error("The working scope changed; visible items were not saved.");
+    async setVisible({ nodeIds, workingSetKey: key, generation, revision }) {
+        if (key !== this.loadKey() || generation !== this.refreshGeneration || !Number.isSafeInteger(revision) || revision <= this.visibilityRevision)
+            throw new Error("The working scope or visibility revision changed; visible items were not saved.");
         if (!Array.isArray(nodeIds) || nodeIds.length > 100 || nodeIds.some(id => typeof id !== "string" || id.length > 100))
             throw new Error("Provide at most 100 visible issue IDs.");
-        this.evidenceNodes = new Set(nodeIds.filter(id => id === "project" || this.issues.some(issue => issue.id === id)));
+        const next = new Set(nodeIds.filter(id => id === "project" || this.issues.some(issue => issue.id === id && (!issue.projectId || issue.projectId === this.project.id))));
+        const newlyVisible = [...next].filter(id => !this.evidenceNodes?.has(id));
+        this.evidenceNodes = next;
+        this.visibilityRevision = revision;
+        if (newlyVisible.length) void this.background(() => this.inSession(() => this.trace.refreshExecution({ source: "github", nodeIds: newlyVisible })));
         return { status: "saved" };
     }
     // Delegates: F-owned; C must not edit; L may append clearRequest

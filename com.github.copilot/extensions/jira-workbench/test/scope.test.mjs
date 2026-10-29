@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_SCOPE, scopeJql, validateScope, workingSetKey, mergeIssues } from "../lib/scope.mjs";
 import { workingSetSummary, childLoadState } from "../lib/view-model.mjs";
-import { buildTree, normalizeIssue } from "../lib/model.mjs";
+import { buildTree, normalizeIssue, descendants } from "../lib/model.mjs";
+import { descendantSessionCounts } from "../lib/view-model.mjs";
 import { Workbench } from "../lib/workbench.mjs";
 
 const row = (id, extra = {}) => ({ id, key: `DEMO-${id}`, projectId: "42", summary: `Work ${id}`, level: 0, status: "To Do", category: "new", dependencies: [], labels: [], ...extra });
@@ -56,7 +57,7 @@ test("a failed scope save keeps the prior working set and reports the persistenc
     const { wb, store } = fixture();
     await wb.refresh();
     store.update = async () => { throw new Error("Disk is full"); };
-    await assert.rejects(wb.applyScope({ kind: "filter", value: "123" }), /Disk is full/);
+    assert.match((await wb.applyScope({ kind: "filter", value: "123" })).pageError, /Disk is full/);
     assert.deepEqual(wb.workingScope, DEFAULT_SCOPE);
     assert.equal(wb.issues[0].id, "1");
     assert.equal(wb.jiraRefreshing, null);
@@ -224,10 +225,129 @@ test("execution evidence reads are bounded to the visible/selected nodes and cap
         for (const issue of wb.issues) data.links[wb.selectedScope(issue.id)] = { sessions: [], prs: [] };
     });
     const read = [];
-    await wb.setVisible({ workingSetKey: wb.loadKey(), nodeIds: ["2", "3"] });
+    await wb.setVisible({ workingSetKey: wb.loadKey(), generation: wb.refreshGeneration, revision: 1, nodeIds: ["2", "3"] });
+    await wb.idle();
     wb.trace.collectTrace = async ({ scope }) => { read.push(scope); throw new Error("test observation"); };
     await assert.rejects(wb.refreshExecution(), /test observation/);
     assert.deepEqual(read.sort(), [wb.selectedScope("2"), wb.selectedScope("3")]);
     assert.equal(gateway.children instanceof Function, true);
     await assert.rejects(wb.setVisible({ workingSetKey: "old", nodeIds: ["1"] }), /changed/);
+});
+
+test("failed scope reads preserve the applied definition, pages and persisted preferences", async () => {
+    const { wb, gateway, store } = fixture();
+    await wb.applyScope({ kind: "filter", value: "123" });
+    const previous = await wb.snapshot();
+    let reads = 0;
+    gateway.issues = async () => { reads++; throw new Error("Invalid Jira field"); };
+    await assert.rejects(wb.applyScope({ kind: "jql", value: 'text ~ "unterminated' }), /unclosed/);
+    assert.equal(reads, 0);
+    const failed = await wb.applyScope({ kind: "jql", value: "badField = yes" });
+    assert.match(failed.pageError, /Scope was not applied.*Invalid Jira field/);
+    assert.deepEqual(failed.issues, previous.issues);
+    assert.deepEqual(failed.page, previous.page);
+    assert.deepEqual(failed.workingScope, previous.workingScope);
+    assert.deepEqual((await store.read()).preferences[wb.selectedScope()].workingScope, previous.workingScope);
+});
+
+test("out-of-order scope update callbacks cannot overwrite the newest durable definition", async () => {
+    const { wb, store } = fixture();
+    const original = store.update;
+    const entered = deferred(), release = deferred();
+    let first = true;
+    store.update = async change => {
+        if (first) { first = false; entered.resolve(); await release.promise; }
+        return original(change);
+    };
+    const old = wb.applyScope({ kind: "filter", value: "111" });
+    await entered.promise;
+    await wb.applyScope({ kind: "filter", value: "222" });
+    release.resolve();
+    await old;
+    assert.equal(wb.workingScope.value, "222");
+    assert.equal((await store.read()).preferences[wb.selectedScope()].workingScope.value, "222");
+});
+
+test("concurrent page outcomes preserve each target's errors independently of banner timing", async () => {
+    const { wb, gateway } = fixture();
+    await wb.refresh();
+    const child = deferred();
+    gateway.children = () => child.promise;
+    const cacheEntered = deferred(), cacheRelease = deferred();
+    wb.cache = { update: async () => { cacheEntered.resolve(); await cacheRelease.promise; } };
+    gateway.issues = async () => ({ issues: [row("2")], fetchedAt: "next" });
+    const more = wb.loadMore();
+    await cacheEntered.promise;
+    const children = wb.loadChildren({ nodeId: "1" });
+    child.resolve(Promise.reject(new Error("child outage")));
+    const failed = await children;
+    cacheRelease.resolve();
+    const success = await more;
+    assert.equal(failed.pageResult.status, "failed");
+    assert.match(failed.pageResult.error, /child outage/);
+    assert.equal(success.pageResult.status, "loaded");
+    assert.equal(success.pageResult.error, null);
+    assert.match(success.pageError, /child outage/, "success does not erase another target's error");
+});
+
+test("id-only ancestry is consistent in descendant enumeration, counts and brief parent sources", async () => {
+    const { wb } = fixture();
+    const parent = row("10", { level: 1, type: "Feature" });
+    const child = row("2", { parentKey: "id:10", parentId: "10" });
+    wb.issues = [parent, child, row("3", { parentKey: "id:2", parentId: "2" })];
+    assert.deepEqual(descendants(wb.issues, "10").map(issue => issue.id), ["2", "3"]);
+    assert.equal(descendantSessionCounts(wb.issues, id => id === "3" ? ["session"] : []).get("10"), 1);
+    const brief = wb.launches.makeBrief(child, "plan", {}, { id: "repo", repo: "example/demo" });
+    assert.ok(brief.sources.some(source => source.key === parent.key));
+});
+
+test("foreign context cannot read, write or navigate traces under the selected project", async () => {
+    const { wb } = fixture();
+    await wb.refresh();
+    await assert.rejects(wb.linkSession({ nodeId: "10", sessionId: "session" }), /own Jira project/);
+    await assert.rejects(wb.refreshTrace("10"), /own Jira project/);
+    await assert.rejects(wb.openSession({ nodeId: "10", sessionId: "session" }), /own Jira project/);
+    await assert.rejects(wb.openPr({ nodeId: "10", repo: "example/demo", number: 1 }), /own Jira project/);
+});
+
+test("visibility reports reject old generations and revisions and refresh newly visible GitHub evidence", async () => {
+    const { wb } = fixture();
+    await wb.refresh();
+    const refreshed = [];
+    wb.trace.refreshExecution = async input => { refreshed.push(input); };
+    const report = (nodeIds, revision, generation = wb.refreshGeneration) => wb.setVisible({ workingSetKey: wb.loadKey(), generation, revision, nodeIds });
+    await report(["1"], 2);
+    await wb.idle();
+    assert.deepEqual(refreshed, [{ source: "github", nodeIds: ["1"] }]);
+    await assert.rejects(report(["10"], 1), /revision changed/);
+    assert.deepEqual([...wb.evidenceNodes], ["1"]);
+    const old = wb.refreshGeneration;
+    await wb.applyScope(DEFAULT_SCOPE);
+    await assert.rejects(report(["10"], 3, old), /changed/);
+    await report(["1"], 4);
+    await wb.idle();
+    assert.equal(refreshed.length, 2, "same-scope reapply refreshes visibility again");
+    await report(["1"], 5);
+    await wb.idle();
+    assert.equal(refreshed.length, 2, "unchanged visible IDs do not repeat GitHub reads");
+});
+
+test("a linked project trace retains a reserved slot under the 100-trace evidence bound", async () => {
+    const { wb, store } = fixture();
+    wb.issues = Array.from({ length: 110 }, (_, index) => row(String(index + 1)));
+    wb.evidenceNodes = new Set(wb.issues.slice(0, 100).map(issue => issue.id));
+    await store.update(data => {
+        for (const id of ["project", ...wb.evidenceNodes]) data.links[wb.selectedScope(id)] = { sessions: [], prs: [] };
+    });
+    const read = [];
+    wb.trace.collectTrace = async ({ scope, previous }) => {
+        read.push(scope);
+        return { scope, previous, next: { ...previous, errors: [] } };
+    };
+    // Fail storage after collection: this test is concerned with target selection, not trace merging.
+    store.update = async () => { throw new Error("collection complete"); };
+    await assert.rejects(wb.refreshExecution(), /collection complete/);
+    assert.equal(read.length, 100);
+    assert.ok(read.includes(wb.selectedScope()));
+    assert.ok(!read.includes(wb.selectedScope("100")));
 });

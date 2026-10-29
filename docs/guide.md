@@ -129,7 +129,10 @@ Choose **JQL** and enter an expression such as `assignee = currentUser()`, or
 choose **Saved filter** and enter its numeric Jira filter ID. Both are
 constrained to the selected project. Press **Apply** to save the scope and
 load its first page. Editing the expression alone does not fetch anything.
-The applied scope survives reopening the panel.
+Apply announces the read while it is pending and restores keyboard focus
+when it finishes. If Jira rejects the scope or saving fails, the previous
+scope and loaded data remain available. Only a successfully applied scope
+survives reopening the panel.
 
 **Load more** requests the next page from Jira. The summary shows how many
 matching items are loaded, any available matching total, and whether more
@@ -155,11 +158,21 @@ items are context only, may belong to another project, and do not increase
 the working-set count. Merely displaying or expanding loaded tree rows never
 crawls another team's siblings or descendants. To launch a context item,
 select its own project and include it in that project's working scope.
+Foreign-project context also has no trace or Link session controls: select
+its owning project to use the correct repository mapping and durable links.
 
 Periodic session and PR evidence reads are limited to at most 100 visible or
-selected loaded items. Selecting an item and using its trace refresh still
-verifies that item directly. Durable links and repository mappings are not
-deleted when you change scope.
+selected loaded items, with one slot reserved for linked project sessions.
+Newly visible items trigger a bounded PR evidence read. Selecting an item in
+the current project and using its trace refresh still verifies that item
+directly. Durable links and repository mappings are not deleted when you
+change scope.
+
+**Update Jira** remains project-wide, not limited to the loaded scope. It
+includes durable session and PR links for up to 300 issues, resolving
+unloaded issue identities separately. Missing, restricted or over-limit
+identities are explicitly reported as omitted evidence for the sync session
+to verify, not as evidence that no work exists.
 
 ---
 

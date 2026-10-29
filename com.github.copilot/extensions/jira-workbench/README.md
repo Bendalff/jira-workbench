@@ -62,8 +62,10 @@ session; there is no automatic child fan-out.
 
 The default server scope is the selected project, ordered by key. **Scope**
 also accepts JQL or a numeric saved Jira filter ID. JQL and filter scopes are
-intersected with the selected project; **Apply** persists the definition in
-the project's preferences. **Search loaded items**, status and sprint
+intersected with the selected project; **Apply** validates the expression and
+stages its first page before persisting the definition in the project's
+preferences. Failed reads or preference writes retain the prior scope and
+loaded data. **Search loaded items**, status and sprint
 filters remain client-side controls. They cannot discover unloaded matches.
 
 Each working-set read requests at most 100 items and returns Jira's actual
@@ -75,7 +77,9 @@ successful read. Cached data stays marked as cached until revalidated.
 Referenced ancestor keys or IDs are deduplicated and read in batches of 50
 without the working scope's constraints, recursively up to 32 levels.
 Cycle protection uses stable IDs and keys. These reads retrieve only the
-referenced parents, not their children. Jira's hierarchy metadata determines
+referenced parents, not their children. Subsequent pages traverse only new
+references and remember missing parents for the current generation.
+Jira's hierarchy metadata determines
 type and level, including custom names such as Feature at level one.
 Missing or restricted parents have visible placeholders; failed ancestor
 reads and the depth safety limit are reported rather than hiding useful work.
@@ -95,16 +99,32 @@ brief previews but does not delete durable artifacts or requests.
 
 Periodic evidence refresh reads at most 100 visible or selected loaded item
 traces. Before the UI reports visibility, it uses at most the first 99 work
-items and the project node. Explicit item trace refresh is unchanged.
+items and the project node. A linked project trace always has a reserved slot.
+Newly visible targets receive a bounded GitHub evidence refresh; polling
+continues to refresh sessions. Foreign-project context cannot view, link or
+refresh traces using the selected project's mapping. Select its owning
+project to use those controls.
+
+Project-wide **Update Jira** gathers evidence from durable project links,
+independently of loaded scope pages. It resolves up to 300 linked issue
+identities and reports missing, restricted, moved or over-limit identities
+as omitted, never as absent work. Workflow status choices exclude foreign
+context items.
 
 Canvas automation can use `set_scope` with `{ kind, value }` to edit the draft,
 then `apply_scope` with empty input, or pass the definition directly to
 `apply_scope`. Supported kinds are `project`, `jql` and `filter`.
 `load_more` advances the working-set cursor; `load_children` accepts
 `{ nodeId }` and advances only that parent's cursor. `get_state` returns
-`workingScope`, `scopeDraft`, `workingSetKey`, `page`, `childPages`,
+`workingScope`, `scopeDraft`, `workingSetKey`, `workingSetGeneration`,
+`visibilityRevision`, `page`, `childPages`,
 `pageError` and `ancestorWarnings`. `set_visible_items` accepts
-`{ workingSetKey, nodeIds }` with at most 100 loaded IDs.
+`{ workingSetKey, generation, revision, nodeIds }` with at most 100 loaded
+IDs. Use the current `workingSetGeneration` as `generation` and a strictly
+increasing integer `revision` greater than the returned `visibilityRevision`.
+Old generations or revisions are rejected. Page actions also return a
+`pageResult` with the target, `loaded`, `failed` or `superseded` status and
+operation-specific error; `pageError` remains the combined banner.
 
 Existing sessions can be opened, explicitly linked by app session ID, or followed
 by a new session. Linking checks the session's Copilot project before saving it.

@@ -377,11 +377,12 @@ export class Gateway {
         if (cursor) args.nextPageToken = cursor;
         const result = await this.call("searchJiraIssuesUsingJql", args, { ...options, optional: { view: "full" } });
         if (!Array.isArray(result.issues)) throw invalid("Jira issue search returned an unsupported response.");
-        const next = result.nextPageToken || null;
+        const next = result.isLast === true ? null : result.nextPageToken || null;
         if (!next && result.isLast !== true && !Number.isFinite(result.total))
             throw invalid("Jira pagination did not report completion or a usable continuation.");
-        if (next && (typeof next !== "string" || next === cursor) || result.isLast === false && !next
-            || !next && Number.isFinite(result.total) && result.total > (result.startAt || 0) + result.issues.length)
+        if (result.isLast !== true && (
+            next && (typeof next !== "string" || next === cursor) || result.isLast === false && !next
+            || !next && Number.isFinite(result.total) && result.total > (result.startAt || 0) + result.issues.length))
             throw invalid("Jira pagination did not advance; no usable continuation was returned.");
         if (next && !result.issues.length) throw invalid("Jira pagination returned an empty page before completion.");
         return {
@@ -398,9 +399,22 @@ export class Gateway {
             throw invalid("Jira child lookup returned an issue outside the requested parent.");
         return page;
     }
-    async ancestors(cloudId, seeds, options = {}) {
-        const known = new Set(seeds.flatMap(issue => [issue.key, issue.id]));
-        const attempted = new Set(), issues = [], warnings = [];
+    async lookupIssues(cloudId, projectId, ids, options = {}) {
+        if (!/^\d+$/.test(projectId) || ids.length > 300 || ids.some(id => !/^\d+$/.test(id)))
+            throw invalid("Issue identity lookup requires a numeric project and at most 300 numeric issue IDs.");
+        const issues = [];
+        for (let offset = 0; offset < ids.length; offset += 50) {
+            const batch = ids.slice(offset, offset + 50);
+            const page = await this.issuePage(cloudId, `project = ${projectId} AND id in (${batch.join(",")})`, options);
+            if (page.nextPageToken || page.issues.some(issue => issue.projectId !== projectId || !batch.includes(issue.id)))
+                throw invalid("Jira issue identity lookup returned incomplete or unrelated results.");
+            issues.push(...page.issues);
+        }
+        return issues;
+    }
+    async ancestors(cloudId, seeds, { existing = [], attemptedParents = [], ...options } = {}) {
+        const known = new Set([...existing, ...seeds].flatMap(issue => [issue.key, issue.id]));
+        const attempted = new Set(attemptedParents), issues = [], warnings = [];
         let frontier = seeds;
         for (let depth = 0; frontier.length && depth < 32; depth++) {
             const references = new Map();
@@ -410,7 +424,7 @@ export class Gateway {
                 if (!ISSUE_KEY.test(ref) && !/^\d+$/.test(ref)) throw invalid("Jira returned an invalid parent reference.");
                 references.set(ref, child);
             }
-            if (!references.size) return { issues, warnings };
+            if (!references.size) return { issues, warnings, attemptedParents: [...attempted] };
             const refs = [...references.keys()];
             frontier = [];
             for (let offset = 0; offset < refs.length; offset += 50) {
@@ -443,6 +457,6 @@ export class Gateway {
             }
         }
         warnings.push("Ancestor depth exceeded 32 levels; remaining parents are shown as unavailable.");
-        return { issues, warnings };
+        return { issues, warnings, attemptedParents: [...attempted] };
     }
 }
