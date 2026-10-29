@@ -121,10 +121,18 @@ export class Trace {
         const pending = (async () => {
             const data = await wb.store.read();
             if (generation !== wb.refreshGeneration || scope !== wb.currentScope()) return wb.snapshot();
-            const targets = [...new Set(["project", ...ids])].slice(0, 100)
-                .filter(id => id === "project" || wb.issues.some(issue => issue.id === id && (!issue.projectId || issue.projectId === wb.project.id)))
+            const loaded = new Set(wb.issues.filter(issue => !issue.projectId || issue.projectId === wb.project.id).map(issue => issue.id));
+            const linkedIds = [...new Set(ids)].filter(id => (id === "project" || loaded.has(id))
+                && data.links[scope.replace(/\/project$/, `/${encodeURIComponent(id)}`)]);
+            let selected = linkedIds;
+            if (!nodeIds && data.links[scope]) {
+                const items = linkedIds.filter(id => id !== "project");
+                const offset = (this.evidenceOffset || 0) % (items.length || 1);
+                selected = ["project", ...items.slice(offset), ...items.slice(0, offset)];
+                this.evidenceOffset = offset + 99;
+            }
+            const targets = selected.slice(0, 100)
                 .map(nodeId => scope.replace(/\/project$/, `/${encodeURIComponent(nodeId)}`))
-                .filter(scope => data.links[scope])
                 .map(scope => ({ scope, previous: data.links[scope] }));
             const linkedSessions = targets.some(target => target.previous.sessions.length);
             // Polling only asks about sessions; with none linked there is nothing to observe or write.

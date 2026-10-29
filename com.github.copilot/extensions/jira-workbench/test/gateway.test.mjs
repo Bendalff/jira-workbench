@@ -220,6 +220,38 @@ test("durable issue identity reads stay bounded and constrained to the selected 
     await assert.rejects(gateway.lookupIssues("site-a", "42", ["bad"]), /numeric/);
 });
 
+test("durable identity batches follow short cursor pages and reject cycles and unrelated results", async () => {
+    const calls = [];
+    const gateway = new Gateway(runtime((name, args) => {
+        calls.push(args.nextPageToken || null);
+        return args.nextPageToken
+            ? { issues: [issue("2", "DEMO-2")], isLast: true }
+            : { issues: [issue("1", "DEMO-1")], nextPageToken: "second", isLast: false };
+    }));
+    assert.deepEqual((await gateway.lookupIssues("site-a", "42", ["1", "2"])).map(row => row.id), ["1", "2"]);
+    assert.deepEqual(calls, [null, "second"]);
+    const cycle = new Gateway(runtime((name, args) => ({ issues: [issue("1", "DEMO-1")], nextPageToken: args.nextPageToken === "a" ? "b" : "a" })));
+    await assert.rejects(cycle.lookupIssues("site-a", "42", ["1", "2", "3", "4"]), /repeated a cursor|exceeded/);
+    const unrelated = new Gateway(runtime(() => ({ issues: [issue("99", "DEMO-99")], isLast: true })));
+    await assert.rejects(unrelated.lookupIssues("site-a", "42", ["1"]), /unrequested/);
+});
+
+test("failed ancestor batches are retryable while successful empty lookups remain remembered", async () => {
+    const gateway = new Gateway(runtime(() => ({})));
+    let attempts = 0;
+    gateway.issuePage = async () => {
+        if (!attempts++) throw Object.assign(new Error("Temporary connection loss"), { kind: "transient" });
+        return { issues: [normalize(issue("10", "PARENT-10"))], nextPageToken: null };
+    };
+    const seeds = [normalize(issue("1", "DEMO-1", "PARENT-10"))];
+    const failed = await gateway.ancestors("site-a", seeds);
+    assert.equal(failed.connectionError, "Temporary connection loss");
+    assert.deepEqual(failed.attemptedParents, []);
+    const retried = await gateway.ancestors("site-a", seeds, { attemptedParents: failed.attemptedParents });
+    assert.equal(retried.issues[0].key, "PARENT-10");
+    assert.deepEqual(retried.attemptedParents, ["PARENT-10"]);
+});
+
 
 test("project picker paginates independently from issue pagination", async () => {
     const gateway = new Gateway(runtime((name, args) => ({

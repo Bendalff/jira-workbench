@@ -133,6 +133,9 @@ Apply announces the read while it is pending and restores keyboard focus
 when it finishes. If Jira rejects the scope or saving fails, the previous
 scope and loaded data remain available. Only a successfully applied scope
 survives reopening the panel.
+If another Apply or a project switch arrives during a successful scope's
+save, it waits until that save is reflected in the panel. A later failed
+scope read retains the last committed scope.
 
 **Load more** requests the next page from Jira. The summary shows how many
 matching items are loaded, any available matching total, and whether more
@@ -151,6 +154,9 @@ closed or cross-project context. Types and levels come from Jira metadata,
 so a level-one **Feature** need not be named **Epic**. Context-only ancestors
 are labeled and cannot launch work. Missing, restricted or unavailable
 parents appear as placeholders; parent lookup failures are reported.
+Transient parent failures can retry on later explicit page reads.
+Authentication or connection failures also activate the normal sign-in or
+recovery state without hiding items already read.
 
 Use an item's **Load children** button to explicitly expand its immediate
 children, then **Load more children** for another page. These additional
@@ -162,8 +168,11 @@ Foreign-project context also has no trace or Link session controls: select
 its owning project to use the correct repository mapping and durable links.
 
 Periodic session and PR evidence reads are limited to at most 100 visible or
-selected loaded items, with one slot reserved for linked project sessions.
-Newly visible items trigger a bounded PR evidence read. Selecting an item in
+selected loaded items, with one periodic slot reserved for linked project
+sessions. When 100 issue traces are visible as well, periodic reads rotate
+the remaining issue into the next poll. Newly visible items refresh their
+session metadata before reading PR evidence, including newly created PRs.
+Selecting an item in
 the current project and using its trace refresh still verifies that item
 directly. Durable links and repository mappings are not deleted when you
 change scope.

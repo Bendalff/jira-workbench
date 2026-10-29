@@ -15,6 +15,7 @@ const portfolio = { ...feature, id: "102", key: "PORT-102", projectId: "44", typ
 let failPage = true;
 gateway.issues = async (site, project, options) => {
     calls.push({ kind: "scope", ...options });
+    if (options.scope.value === "invalid") throw new Error("Synthetic invalid scope");
     if (options.cursor) {
         if (failPage) throw new Error("Synthetic page outage");
         return { issues: [{ ...issues[5], parentKey: feature.key }], total: 2, nextPageToken: null, fetchedAt: new Date().toISOString() };
@@ -68,6 +69,12 @@ try {
     assert.equal(await page.locator("#load-more").evaluate(element => element === document.activeElement), true, "failed page restores retry control focus");
     assert.ok((await workbench.snapshot()).issues.some(issue => issue.id === task.id));
     assert.equal(workbench.page.nextPageToken, "page-two", "failed page keeps its continuation");
+    await page.locator("#scope-value").fill("invalid");
+    await page.locator("#apply-scope").click();
+    await page.waitForFunction(() => !document.getElementById("apply-scope").disabled);
+    assert.match(await page.locator("#connection-status").innerText(), /Scope was not applied: Synthetic invalid scope/);
+    assert.doesNotMatch(await page.locator("#connection-status").innerText(), /Scope applied\./);
+    assert.match((await workbench.snapshot()).pageError, /Synthetic page outage.*\nScope was not applied/);
     failPage = false;
     await page.locator("#load-more").click();
     await page.locator("#load-more").waitFor({ state: "hidden" });
@@ -127,13 +134,38 @@ try {
     await page.waitForRequest(request => request.url().endsWith("/api/visible"));
     assert.ok(visibility.some(input => input.generation === workbench.refreshGeneration && input.revision > 0), "same-scope apply sends versioned visibility again");
 
-    // Identical saved definitions in different projects must not retain an unsaved draft.
-    await page.locator("#scope-value").fill("unapplied draft");
+    // Superseding Apply clears its status, without clearing the project's saved selection/collapse state.
+    await page.locator("#view-hierarchy").click();
+    await page.getByRole("treeitem", { name: /DEMO-2 Scoped task/ }).click();
+    const savedView = page.waitForResponse(response => response.url().endsWith("/api/preferences") && response.ok());
+    await featureRow.getByRole("button", { name: "Collapse PARENT-101", exact: true }).click();
+    await savedView;
+    const heldApply = deferred(), releaseApply = deferred();
+    await page.route("**/api/scope", async route => {
+        const response = await route.fetch();
+        heldApply.resolve();
+        await releaseApply.promise;
+        await route.fulfill({ response });
+    });
+    await page.locator("#apply-scope").click();
+    await heldApply.promise;
     await store.update(data => { data.preferences["demo-site/43/project"] = { workingScope: { kind: "filter", value: "456" } }; });
     await page.locator("#project").selectOption("43");
     await page.waitForFunction(() => document.getElementById("scope-value").value === "456");
+    assert.doesNotMatch(await page.locator("#connection-status").innerText(), /Applying scope/);
+    releaseApply.resolve();
+    await page.waitForResponse(response => response.url().endsWith("/api/scope"));
+    await page.unroute("**/api/scope");
+
+    // Identical saved definitions in different projects must not retain an unsaved draft.
+    await page.locator("#scope-value").fill("unapplied draft");
     await page.locator("#project").selectOption("42");
     await page.waitForFunction(() => document.getElementById("project-title").textContent === "Daily execution demo");
+    await page.waitForFunction(() => document.getElementById("scope-value").value === "456");
+    await featureRow.getByRole("button", { name: "Expand PARENT-101", exact: true }).waitFor();
+    const savedSelection = await store.read();
+    assert.equal(savedSelection.preferences[scope].selected, task.id);
+    assert.ok(savedSelection.preferences[scope].collapsed.includes("101"));
 
     await page.evaluate(() => {
         window.summaryMutations = 0;
@@ -146,9 +178,54 @@ try {
     await page.waitForFunction(() => document.getElementById("scope-value").value === "456");
     await page.locator("#view-hierarchy").click();
     await page.getByRole("treeitem", { name: /PARENT-101 Cross-project feature/ }).waitFor();
+    await featureRow.getByRole("button", { name: "Expand PARENT-101", exact: true }).click();
+
+    const pageEntered = deferred(), pageRelease = deferred();
+    const readIssues = gateway.issues;
+    gateway.issues = async (...args) => {
+        if (args[2].cursor) { pageEntered.resolve(); await pageRelease.promise; }
+        return readIssues(...args);
+    };
+    await page.locator("#load-more").click();
+    await pageEntered.promise;
+    await page.locator("#refresh").click();
+    await page.waitForFunction(() => !document.getElementById("refresh").disabled);
+    pageRelease.resolve();
+    await page.waitForFunction(() => document.getElementById("notice").innerText.includes("superseded"));
+    assert.doesNotMatch(await page.locator("#notice").innerText(), /Working-set page loaded/);
+    gateway.issues = readIssues;
+
+    // A -> B (still in flight) -> A must send a newer report even though A was acknowledged.
+    await page.reload();
+    await page.waitForFunction(() => document.getElementById("scope-value").value === "456");
+    await page.locator("#view-hierarchy").click();
+    await featureRow.getByRole("button", { name: "Expand PARENT-101", exact: true }).click();
+    await page.getByRole("treeitem", { name: /PORT-102 Portfolio context/ }).click();
+    await page.waitForRequest(request => request.url().endsWith("/api/visible") && request.postDataJSON().nodeIds.includes(task.id));
+    const bEntered = deferred(), releaseB = deferred();
+    let bRevision;
+    await page.route("**/api/visible", async route => {
+        const input = route.request().postDataJSON();
+        const response = await route.fetch();
+        if (!input.nodeIds.includes(task.id)) {
+            bRevision = input.revision;
+            bEntered.resolve();
+            await releaseB.promise;
+        }
+        await route.fulfill({ response });
+    });
+    await page.locator("#search").fill("Portfolio context");
+    await bEntered.promise;
+    const restoredA = page.waitForResponse(response => response.url().endsWith("/api/visible")
+        && response.request().postDataJSON().revision > bRevision && response.request().postDataJSON().nodeIds.includes(task.id));
+    await page.locator("#search").fill("");
+    await restoredA;
+    releaseB.resolve();
+    await page.unroute("**/api/visible", { behavior: "wait" });
+    assert.ok(workbench.evidenceNodes.has(task.id), "returning to A supersedes in-flight B");
     await page.screenshot({ path: screenshotPath("scoped-loading.png") });
     assert.deepEqual(errors, []);
-    console.log("PASS: persisted transactional scopes, bounded pages and retry, cross-project hierarchy and trace isolation, lazy children, stale page response isolation, versioned visibility after same-scope Apply, project-aware draft reset, stable live summaries, Apply status and keyboard focus after Apply/child/final/retry pages. All services were synthetic; no Jira writes.");
+    console.log("PASS: transactional scopes, bounded pages/retry, cross-project hierarchy and trace isolation, lazy children, stale/superseded page outcomes, versioned same-scope and A-B-A visibility, restored per-project selection/collapse and drafts, accurate failed/superseded Apply status, stable live summaries, and keyboard focus. All services were synthetic; no Jira writes.");
 } finally {
     await browser.close();
     await server.close();

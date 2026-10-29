@@ -405,12 +405,28 @@ export class Gateway {
         const issues = [];
         for (let offset = 0; offset < ids.length; offset += 50) {
             const batch = ids.slice(offset, offset + 50);
-            const page = await this.issuePage(cloudId, `project = ${projectId} AND id in (${batch.join(",")})`, options);
-            if (page.nextPageToken || page.issues.some(issue => issue.projectId !== projectId || !batch.includes(issue.id)))
-                throw invalid("Jira issue identity lookup returned incomplete or unrelated results.");
-            issues.push(...page.issues);
+            for await (const page of this.referencePages(cloudId, `project = ${projectId} AND id in (${batch.join(",")})`, batch, options)) {
+                if (page.issues.some(issue => issue.projectId !== projectId))
+                    throw invalid("Jira issue identity lookup returned unrelated project results.");
+                issues.push(...page.issues);
+            }
         }
         return issues;
+    }
+    async *referencePages(cloudId, jql, references, { read = run => run({}), ...options } = {}) {
+        let cursor = null, received = 0;
+        const seen = new Set();
+        do {
+            const page = await read(readOptions => this.issuePage(cloudId, jql, { ...options, ...readOptions, cursor }));
+            received += page.issues.length;
+            if (received > references.length) throw invalid("Jira reference lookup exceeded its distinct requested parents or issues.");
+            if (page.issues.some(issue => !references.includes(issue.key) && !references.includes(issue.id)))
+                throw invalid("Jira reference lookup returned an unrequested issue.");
+            yield page;
+            cursor = page.nextPageToken;
+            if (cursor && seen.has(cursor)) throw invalid("Jira reference pagination repeated a cursor.");
+            if (cursor) seen.add(cursor);
+        } while (cursor);
     }
     async ancestors(cloudId, seeds, { existing = [], attemptedParents = [], ...options } = {}) {
         const known = new Set([...existing, ...seeds].flatMap(issue => [issue.key, issue.id]));
@@ -429,34 +445,26 @@ export class Gateway {
             frontier = [];
             for (let offset = 0; offset < refs.length; offset += 50) {
                 const batch = refs.slice(offset, offset + 50);
-                batch.forEach(ref => attempted.add(ref));
                 const keys = batch.filter(ref => ISSUE_KEY.test(ref)), ids = batch.filter(ref => /^\d+$/.test(ref));
                 const jql = [keys.length ? `key in (${keys.map(key => `"${key}"`).join(",")})` : "", ids.length ? `id in (${ids.join(",")})` : ""].filter(Boolean).join(" OR ");
                 try {
-                    let cursor = null;
-                    const seen = new Set();
-                    let received = 0;
-                    do {
-                        const page = await this.issuePage(cloudId, jql, { ...options, cursor, sprintField: this.sprintFields.get(cloudId) });
-                        received += page.issues.length;
-                        if (received > batch.length) throw invalid("Jira ancestor lookup exceeded its distinct requested parents.");
+                    for await (const page of this.referencePages(cloudId, jql, batch, { ...options, sprintField: this.sprintFields.get(cloudId) })) {
                         for (const issue of page.issues) {
-                            if (!batch.includes(issue.key) && !batch.includes(issue.id)) throw invalid("Jira ancestor lookup returned an unrequested issue.");
                             if (known.has(issue.id) || known.has(issue.key)) continue;
                             known.add(issue.id); known.add(issue.key);
                             const context = { ...issue, contextOnly: true };
                             issues.push(context); frontier.push(context);
                         }
-                        cursor = page.nextPageToken;
-                        if (cursor && seen.has(cursor)) throw invalid("Jira ancestor pagination repeated a cursor.");
-                        if (cursor) seen.add(cursor);
-                    } while (cursor);
+                    }
+                    batch.forEach(ref => attempted.add(ref));
                 } catch (error) {
                     warnings.push(`Parent lookup failed: ${error.message}`);
+                    if (error.kind && error.kind !== "permanent")
+                        return { issues, warnings, attemptedParents: [...attempted], connectionError: error.message };
                 }
             }
         }
-        warnings.push("Ancestor depth exceeded 32 levels; remaining parents are shown as unavailable.");
+        if (frontier.length) warnings.push("Ancestor depth exceeded 32 levels; remaining parents are shown as unavailable.");
         return { issues, warnings, attemptedParents: [...attempted] };
     }
 }

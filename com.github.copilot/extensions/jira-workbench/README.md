@@ -67,6 +67,9 @@ stages its first page before persisting the definition in the project's
 preferences. Failed reads or preference writes retain the prior scope and
 loaded data. **Search loaded items**, status and sprint
 filters remain client-side controls. They cannot discover unloaded matches.
+Scope reads may overlap, but once a successful scope begins its durable
+commit, subsequent Apply, refresh and project-selection mutations wait until
+disk and memory agree. A failing successor retains that last committed scope.
 
 Each working-set read requests at most 100 items and returns Jira's actual
 continuation. **Load more** appends one page; it never crawls to a size cap.
@@ -79,6 +82,9 @@ without the working scope's constraints, recursively up to 32 levels.
 Cycle protection uses stable IDs and keys. These reads retrieve only the
 referenced parents, not their children. Subsequent pages traverse only new
 references and remember missing parents for the current generation.
+Failed batches remain retryable; authentication and connection failures
+also reach the connection supervisor while already read items stay visible
+as stale data.
 Jira's hierarchy metadata determines
 type and level, including custom names such as Feature at level one.
 Missing or restricted parents have visible placeholders; failed ancestor
@@ -99,9 +105,12 @@ brief previews but does not delete durable artifacts or requests.
 
 Periodic evidence refresh reads at most 100 visible or selected loaded item
 traces. Before the UI reports visibility, it uses at most the first 99 work
-items and the project node. A linked project trace always has a reserved slot.
-Newly visible targets receive a bounded GitHub evidence refresh; polling
-continues to refresh sessions. Foreign-project context cannot view, link or
+items and the project node. Periodic reads reserve a slot only for a linked
+project trace, rotating visible issue overflow into the next poll.
+Explicit target reads do not add unrelated project work.
+Newly visible targets refresh session metadata before GitHub evidence so
+new PRs are discovered; polling continues to refresh sessions.
+Foreign-project context cannot view, link or
 refresh traces using the selected project's mapping. Select its owning
 project to use those controls.
 
@@ -125,6 +134,9 @@ increasing integer `revision` greater than the returned `visibilityRevision`.
 Old generations or revisions are rejected. Page actions also return a
 `pageResult` with the target, `loaded`, `failed` or `superseded` status and
 operation-specific error; `pageError` remains the combined banner.
+`scopeError` identifies the Apply error independently of other page errors,
+and Apply returns `applyResult.status` (`applied`, `failed` or `superseded`).
+Superseded page actions never announce a completed load.
 
 Existing sessions can be opened, explicitly linked by app session ID, or followed
 by a new session. Linking checks the session's Copilot project before saving it.

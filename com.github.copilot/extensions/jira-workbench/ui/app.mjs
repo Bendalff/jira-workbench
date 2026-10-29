@@ -15,6 +15,7 @@ const token = location.hash.slice(1);
 const filters = [["needs-me", "Needs me"], ["running", "Running"], ["prs", "PRs to review"], ["available", "Available to start"], ["all", "All work"]];
 const defaults = () => ({ view: "execution", executionFilter: "all", selected: null, collapsed: [], query: "", category: "all", sprint: "all", scrollTop: 0, detailsOpen: false });
 let state = { sites: [], projects: [], appProjects: [], issues: [], links: {}, requests: [], executions: [], navigationReceipts: [], tree: { roots: [], warnings: [] }, catalogErrors: [] };
+let itemsById = new Map();
 let ui = defaults(), tab = "trace", focusedNode = null, scopeEpoch = 0;
 let selecting = false, scopeConfirmed = true, selectionVersion = 0, selectionChain = Promise.resolve(), pollPending = false, snapshotVersion = 0;
 let preferenceTimer, preferenceRequest, preferenceRevision = 0;
@@ -28,7 +29,7 @@ const initialPreferenceEdits = new Set();
 const disclosures = new Map(), linkDrafts = new Map(), submittedPreviews = new Set();
 const connectionMessages = new Map();
 const executionRefreshes = new Map();
-let visibleTimer, visibleSignature = "", visibleRevision = 0;
+let visibleTimer, visibleSignature = "", visibleRevision = 0, visiblePending = null;
 const visibleIds = new Set();
 const visibleObserver = new IntersectionObserver(entries => {
     for (const entry of entries) {
@@ -45,15 +46,22 @@ function queueVisibleItems() {
     visibleTimer = setTimeout(async () => {
         const nodeIds = [...new Set([ui.selected, ...visibleIds].filter(Boolean))].slice(0, 100);
         const signature = JSON.stringify([key, generation, epoch, nodeIds]);
-        if (signature === visibleSignature || epoch !== scopeEpoch) return;
+        if (signature === (visiblePending?.signature || visibleSignature) || epoch !== scopeEpoch) return;
+        const request = { signature, revision: ++visibleRevision };
+        visiblePending = request;
         try {
-            const revision = ++visibleRevision;
+            const { revision } = request;
             await api("visible", { workingSetKey: key, generation, revision, nodeIds });
             if (epoch === scopeEpoch && generation === state.workingSetGeneration && revision === visibleRevision) {
                 visibleSignature = signature; connectionMessage("visible", "");
             }
         } catch (error) {
-            if (epoch === scopeEpoch) connectionMessage("visible", `Visible-item evidence selection could not be saved: ${error.message}`);
+            if (epoch === scopeEpoch && generation === state.workingSetGeneration && request === visiblePending) {
+                visibleSignature = "";
+                connectionMessage("visible", `Visible-item evidence selection could not be saved: ${error.message}`);
+            }
+        } finally {
+            if (request === visiblePending) visiblePending = null;
         }
     }, 100);
 }
@@ -106,7 +114,7 @@ function setSource(element, text, tone, detail) {
 const nodeLaunch = id => launchState({ local: actions.get(actionKey("launch", id)), requests: state.requests, nodeId: id });
 const nodePending = id => launchBlocks(nodeLaunch(id));
 function getItem(id) {
-    if (id !== "project") return state.issues.find(item => item.id === id);
+    if (id !== "project") return itemsById.get(id);
     if (!state.project) return null;
     return {
         id: "project", key: state.project.key, summary: state.project.name, type: "Project", level: 2,
@@ -134,8 +142,8 @@ async function loadPageAction(path, input, context) {
     const generation = state.workingSetGeneration;
     const version = ++snapshotVersion;
     const snapshot = await api(path, input);
-    if (!context.current() || generation !== state.workingSetGeneration) return snapshot;
-    if (snapshot.workingSetGeneration !== generation || snapshot.pageResult?.status === "superseded") return snapshot;
+    if (!context.current() || generation !== state.workingSetGeneration
+        || snapshot.workingSetGeneration !== generation || snapshot.pageResult?.status === "superseded") return { status: "superseded" };
     if (version === snapshotVersion) acceptSnapshot(snapshot);
     if (snapshot.pageResult?.error) throw new Error(snapshot.pageResult.error);
     return snapshot;
@@ -267,7 +275,7 @@ function acceptSnapshot(snapshot, { allowScopeChange = false } = {}) {
     }
     scopeConfirmed = true;
     connectionMessage("scope", "");
-    if (changedWorkingSet) {
+    if (changedWorkingSet && !changedScope) {
         closePreview();
         ui.selected = null;
         collapsed.clear();
@@ -275,6 +283,7 @@ function acceptSnapshot(snapshot, { allowScopeChange = false } = {}) {
     }
     if (preview && state.mapping?.id !== snapshot.mapping?.id) markPreviewDirty();
     state = { ...snapshot, executions: snapshot.executions || [], navigationReceipts: snapshot.navigationReceipts || [] };
+    itemsById = new Map(state.issues.map(issue => [issue.id, issue]));
     visibleRevision = Math.max(visibleRevision, snapshot.visibilityRevision || 0);
     queueVisibleItems();
     reconcileReceipts();
@@ -326,7 +335,10 @@ async function perform({ kind, target, nodeId, label, work, success, refresh = f
     paintFeedback();
     try {
         const result = await work({ scope, epoch, current: () => scope === state.scope && epoch === scopeEpoch && !selecting && scopeConfirmed });
-        if (result?.requestId) {
+        if (result?.status === "superseded") {
+            record.status = "superseded";
+            record.message = `${label} was superseded; no page was installed by this action.`;
+        } else if (result?.requestId) {
             if (!["queued", "acknowledged", "failed"].includes(result.status)) throw new Error("The host returned an unrecognized receipt status.");
             record.requestId = result.requestId;
             record.status = result.status;
@@ -1287,6 +1299,7 @@ function selectProject(cloudId, jiraProjectId) {
     scopeEpoch++;
     selecting = true;
     scopeConfirmed = false;
+    connectionMessage("apply-scope", "");
     connectionMessage("selection", "Loading selected project...");
     render();
     selectionChain = selectionChain.then(async () => {
@@ -1345,7 +1358,8 @@ $("apply-scope").addEventListener("click", async () => {
         const snapshot = await api("scope", definition);
         if (epoch === scopeEpoch) {
             acceptSnapshot(snapshot);
-            connectionMessage("apply-scope", snapshot.pageError?.startsWith("Scope was not applied:") ? snapshot.pageError : "Scope applied.");
+            connectionMessage("apply-scope", snapshot.scopeError || (snapshot.applyResult?.status === "superseded"
+                ? "Scope application was superseded." : "Scope applied."));
         }
     } catch (error) {
         if (epoch === scopeEpoch) connectionMessage("apply-scope", `Scope was not applied: ${error.message}`);
