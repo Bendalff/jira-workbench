@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Gateway, resolveToolResult } from "../lib/gateway.mjs";
+import { normalizeIssue as normalize } from "../lib/model.mjs";
 import { isConnector, preferred, signInError } from "../lib/runtime.mjs";
 import { CONNECTOR, fakeRuntime, PROJECTS } from "./fake-runtime.mjs";
 
@@ -42,7 +43,7 @@ function runtime(respond) {
 }
 
 
-test("loads every issue page with an explicit project filter, including epics outside sprints", async () => {
+test("loads one bounded issue page and continues only when requested, including parents outside sprints", async () => {
     const calls = [];
     const gateway = new Gateway(runtime((name, args) => {
         calls.push({ name, args });
@@ -51,7 +52,12 @@ test("loads every issue page with an explicit project filter, including epics ou
             { issues: [issue("1", "DEMO-1", null, "Epic")], nextPageToken: "next", isLast: false };
     }));
     const result = await gateway.issues("site-a", "42");
-    assert.equal(result.issues.length, 2);
+    assert.equal(result.issues.length, 1);
+    assert.equal(result.nextPageToken, "next");
+    assert.equal(calls.filter(call => !/sprint/i.test(call.args.jql)).length, 1);
+    const next = await gateway.issues("site-a", "42", { cursor: result.nextPageToken });
+    assert.equal(next.issues[0].key, "DEMO-2");
+    assert.equal(next.nextPageToken, null);
     const pages = calls.filter(call => !/sprint/i.test(call.args.jql));
     assert.equal(pages.length, 2);
     assert.match(pages[0].args.jql, /^project = 42 /);
@@ -109,7 +115,72 @@ test("Jira gateway refuses writes and rejects a project identifier that could in
 
 test("pagination failures are visible instead of pretending the hierarchy is complete", async () => {
     const gateway = new Gateway(runtime(() => ({ issues: [issue("1", "DEMO-1")], nextPageToken: "same" })));
-    await assert.rejects(gateway.issues("site-a", "42"), /pagination/i);
+    await assert.rejects(gateway.issues("site-a", "42", { cursor: "same" }), /pagination/i);
+});
+
+test("scoped pages constrain only working items; recursive ancestor batches cross projects and use hierarchy metadata", async () => {
+    const calls = [];
+    const child = issue("3", "DEMO-3", "PARENT-2");
+    const feature = issue("2", "PARENT-2", "PORT-1", "Feature");
+    feature.fields.project.id = "43";
+    feature.fields.issuetype.hierarchyLevel = 1;
+    const portfolio = issue("1", "PORT-1", null, "Portfolio Epic");
+    portfolio.fields.project.id = "44";
+    portfolio.fields.issuetype.hierarchyLevel = 2;
+    const gateway = new Gateway(runtime((name, args) => {
+        calls.push(args);
+        if (/sprint is not EMPTY/.test(args.jql)) return { issues: [], isLast: true };
+        if (args.jql.startsWith("key in")) return { issues: args.jql.includes("PARENT-2") ? [feature] : [portfolio], isLast: true };
+        assert.match(args.jql, /^project = 42 AND \(assignee = currentUser\(\)\) ORDER BY updated DESC$/);
+        return { issues: [child], isLast: true };
+    }));
+    const page = await gateway.issues("site-a", "42", { scope: { kind: "jql", value: "assignee = currentUser() ORDER BY updated DESC" } });
+    const parents = await gateway.ancestors("site-a", [...page.issues, ...page.issues]);
+    assert.deepEqual(parents.issues.map(row => [row.type, row.level, row.contextOnly]), [["Feature", 1, true], ["Portfolio Epic", 2, true]]);
+    assert.equal(calls.filter(args => args.jql.startsWith("key in")).length, 2);
+    assert.ok(calls.filter(args => args.jql.startsWith("key in")).every(args => !/project|assignee|status|updated|component/.test(args.jql)));
+});
+
+test("ancestor lookups deduplicate, terminate cycles and leave missing references unresolved without sibling reads", async () => {
+    let reads = 0;
+    const gateway = new Gateway(runtime((name, args) => {
+        reads++;
+        assert.match(args.jql, /^key in/);
+        return { issues: args.jql.includes("PARENT-1") ? [issue("1", "PARENT-1", "DEMO-2")] : [], isLast: true };
+    }));
+    const seeds = [issue("2", "DEMO-2", "PARENT-1"), issue("3", "DEMO-3", "PARENT-1"), issue("4", "DEMO-4", "MISSING-1")].map(raw => normalize(raw));
+    const result = await gateway.ancestors("site-a", seeds);
+    assert.equal(result.issues.length, 1);
+    assert.equal(reads, 1);
+    assert.deepEqual(result.warnings, []);
+});
+
+test("ancestor failures are explicit while already retrieved parents remain useful", async () => {
+    const gateway = new Gateway(runtime(() => { throw new Error("Permission denied"); }), { transientRetries: 0 });
+    const result = await gateway.ancestors("site-a", [normalize(issue("2", "DEMO-2", "PARENT-1"))]);
+    assert.deepEqual(result.issues, []);
+    assert.match(result.warnings[0], /Parent lookup failed: Permission denied/);
+});
+
+test("children are one explicit parent-only page, with real continuation and no working-set constraints", async () => {
+    const calls = [];
+    const gateway = new Gateway(runtime((name, args) => {
+        calls.push(args);
+        assert.equal(args.jql, "parent = 1 ORDER BY key ASC");
+        return { issues: [issue("2", "TEAM-2", "PARENT-1")], nextPageToken: "children-next", isLast: false };
+    }));
+    const page = await gateway.children("site-a", { id: "1", key: "PARENT-1" });
+    assert.equal(calls.length, 1);
+    assert.equal(page.nextPageToken, "children-next");
+    assert.equal(calls[0].maxResults, 100);
+    assert.ok(!/project|assignee|component/.test(calls[0].jql));
+});
+
+test("missing completion metadata and unsupported child results fail explicitly", async () => {
+    const gateway = new Gateway(runtime(() => ({ issues: [issue("2", "DEMO-2", "PARENT-9")], isLast: true })));
+    await assert.rejects(gateway.children("site-a", { id: "1", key: "PARENT-1" }), /outside the requested parent/);
+    const unknown = new Gateway(runtime(() => ({ issues: [issue("2", "DEMO-2")] })));
+    await assert.rejects(unknown.issuePage("site-a", "project = 42"), /completion|continuation/);
 });
 
 

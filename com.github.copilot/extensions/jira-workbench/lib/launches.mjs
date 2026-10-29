@@ -18,10 +18,13 @@ export class Launches {
     async prepare({ nodeId, mode, fields, smartCommitComment = false }) {
         const wb = this.workbench;
         const scope = wb.selectedScope(nodeId), node = wb.node(nodeId);
+        const workingSetKey = wb.loadKey(), scopeGeneration = wb.refreshGeneration;
+        if (node.contextOnly) throw new Error("This item is context only. Include it in a project working scope before launching work.");
         if (wb.error) throw new Error("Refresh Jira successfully before starting work from stale data.");
         if (wb.cached) throw new Error("Jira is still refreshing the cached snapshot. Try again when it is current.");
         const data = await wb.store.read(), mapping = data.mappings[wb.selectedScope()];
         if (scope !== wb.selectedScope(nodeId)) throw new Error("Project changed while preparing the brief.");
+        if (workingSetKey !== wb.loadKey() || scopeGeneration !== wb.refreshGeneration) throw new Error("Working scope changed while preparing the brief.");
         if (!mapping) throw new Error("Select the Copilot repository for this Jira project before starting a session.");
         if (!wb.verified.apps) throw new Error("Copilot repository projects are not confirmed yet. Reload connections and try again.");
         if (!wb.appProjects.some(p => p.id === mapping.id)) throw new Error("The mapped Copilot project is no longer available; choose another repository.");
@@ -33,6 +36,7 @@ export class Launches {
         if (children.length > 500) throw new Error("This scope contains more than 500 descendants. Select a smaller epic or issue.");
         const preview = {
             id: randomUUID(), scope, node, children, mapping, mode, smartCommitComment, expiresAt: Date.now() + 300_000,
+            workingSetKey, scopeGeneration,
             existing: data.links[scope]?.sessions || [],
             cloudId: wb.site.id, jiraProjectId: wb.project.id, siteUrl: wb.site.url,
             brief: this.makeBrief(node, mode, fields, mapping, smartCommitComment),
@@ -46,9 +50,12 @@ export class Launches {
         const preview = wb.previews.get(previewId);
         if (!preview || preview.expiresAt < Date.now()) throw new Error("The launch preview expired or was already used. Review the scope again.");
         if (preview.scope !== wb.selectedScope(preview.node.id)) throw new Error("Project changed after preview. Review the scope again.");
+        if (preview.workingSetKey !== wb.loadKey()) throw new Error("Working scope changed after preview. Review the scope again.");
         if (wb.error) throw new Error("Jira data is stale. Refresh and review the brief again.");
         if (wb.cached) throw new Error("Jira data is a cached snapshot. Refresh and review the brief again.");
         const currentData = await wb.store.read();
+        if (preview.workingSetKey !== wb.loadKey() || preview.scopeGeneration !== wb.refreshGeneration)
+            throw new Error("Working scope changed after preview. Review the scope again.");
         const currentMapping = currentData.mappings[wb.selectedScope()];
         if (!currentMapping || currentMapping.id !== preview.mapping.id) throw new Error("Repository mapping changed after preview.");
         const currentBrief = this.makeBrief(wb.node(preview.node.id), preview.mode, preview.brief.fields, currentMapping, preview.smartCommitComment);
@@ -65,6 +72,8 @@ export class Launches {
             brief: { ...structuredClone(preview.brief), children: preview.brief.children.map(child => child.key) },
         };
         await wb.store.update(data => {
+            if (preview.workingSetKey !== wb.loadKey() || preview.scopeGeneration !== wb.refreshGeneration)
+                throw new Error("Working scope changed while launching. Review the scope again.");
             if (data.mappings[wb.selectedScope()]?.id !== preview.mapping.id) throw new Error("Repository mapping changed after preview.");
             if (Object.values(data.requests).some(r => r.scope === preview.scope && requestStatus(r) === "queued"))
                 throw new Error("A session request is already queued for this scope. Wait for its receipt; do not create a duplicate.");

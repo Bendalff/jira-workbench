@@ -112,7 +112,7 @@ Fill them in from left to right:
 
 1. **Jira site**: your Atlassian site.
 2. **Project**: any Jira project you can browse. No active sprint is required;
-   the canvas shows all of the project's work.
+   the canvas loads its first 100 matching items, not the entire project.
 3. **Copilot repository**: the repository Copilot should work in.
 
 > [!IMPORTANT]
@@ -121,6 +121,45 @@ Fill them in from left to right:
 > mapping you create.
 
 The mapping is saved per project, so you set it once.
+
+### Choose a working scope
+
+Use **Scope** to bound what Jira returns. **Project** is the safe default.
+Choose **JQL** and enter an expression such as `assignee = currentUser()`, or
+choose **Saved filter** and enter its numeric Jira filter ID. Both are
+constrained to the selected project. Press **Apply** to save the scope and
+load its first page. Editing the expression alone does not fetch anything.
+The applied scope survives reopening the panel.
+
+**Load more** requests the next page from Jira. The summary shows how many
+matching items are loaded, any available matching total, and whether more
+pages remain. A failed next page leaves the useful loaded data and cursor
+intact and reports the error so you can retry. **Refresh** starts again from
+the first page of the applied scope.
+
+**Search loaded items**, status and sprint controls only filter the loaded
+copy. They do not change the server scope or discover unloaded matches.
+Metrics, progress and descendant counts describe loaded items, not complete
+project or child totals.
+
+In **Hierarchy**, referenced parents are read separately without applying
+your assignee, status, date or component constraints. This preserves old,
+closed or cross-project context. Types and levels come from Jira metadata,
+so a level-one **Feature** need not be named **Epic**. Context-only ancestors
+are labeled and cannot launch work. Missing, restricted or unavailable
+parents appear as placeholders; parent lookup failures are reported.
+
+Use an item's **Load children** button to explicitly expand its immediate
+children, then **Load more children** for another page. These additional
+items are context only, may belong to another project, and do not increase
+the working-set count. Merely displaying or expanding loaded tree rows never
+crawls another team's siblings or descendants. To launch a context item,
+select its own project and include it in that project's working scope.
+
+Periodic session and PR evidence reads are limited to at most 100 visible or
+selected loaded items. Selecting an item and using its trace refresh still
+verifies that item directly. Durable links and repository mappings are not
+deleted when you change scope.
 
 ---
 

@@ -10,7 +10,7 @@ function plainText(value) {
 }
 
 export function descendants(issues, nodeId) {
-    if (nodeId === "project") return issues;
+    if (nodeId === "project") return issues.filter(issue => !issue.contextOnly);
     const root = issues.find(issue => issue.id === nodeId);
     if (!root) return [];
     const keys = new Set([root.key]), children = [];
@@ -65,7 +65,9 @@ export function normalizeIssue(raw, { sprintField = null } = {}) {
         id: String(raw.id), key: raw.key, summary: f.summary || "Untitled",
         projectId: String(f.project?.id || ""), type: f.issuetype?.name || "Issue",
         level: f.issuetype?.hierarchyLevel ?? (f.issuetype?.subtask ? -1 : 0),
-        parentKey: f.parent?.key || null, parentId: f.parent?.id || null,
+        parentKey: f.parent?.key || (f.parent?.id ? `id:${f.parent.id}` : null), parentId: f.parent?.id ? String(f.parent.id) : null,
+        parentType: f.parent?.fields?.issuetype?.name || null,
+        parentLevel: f.parent?.fields?.issuetype?.hierarchyLevel ?? null,
         status: f.status?.name || "Unknown", category: f.status?.statusCategory?.key || "unknown",
         description: plainText(f.description).trim(), assignee: f.assignee?.displayName || "Unassigned",
         priority: f.priority?.name || "Not set", labels: f.labels || [], updated: f.updated || null, sprints,
@@ -83,8 +85,23 @@ export function normalizeIssue(raw, { sprintField = null } = {}) {
 
 export function buildTree(issues) {
     const nodes = new Map(issues.map(issue => [issue.key, { issue, children: [], total: 0, done: 0 }]));
+    const ids = new Map(issues.map(issue => [issue.id, issue]));
     const roots = [], warnings = [];
-    for (const node of nodes.values()) {
+    for (const issue of issues) {
+        if (!issue.parentKey || nodes.has(issue.parentKey)) continue;
+        const byId = issue.parentId && ids.get(issue.parentId);
+        if (byId) { nodes.set(issue.parentKey, nodes.get(byId.key)); continue; }
+        warnings.push(`${issue.key}: parent ${issue.parentKey} is missing, restricted or unavailable.`);
+        nodes.set(issue.parentKey, {
+            issue: {
+                id: `missing:${issue.parentKey}`, key: issue.parentKey, summary: "Parent missing, restricted or unavailable",
+                type: issue.parentType || "Parent", level: issue.parentLevel ?? issue.level + 1,
+                status: "Unavailable", category: "unknown", contextOnly: true, missing: true,
+                parentKey: null, labels: [], dependencies: [],
+            }, children: [], total: 0, done: 0,
+        });
+    }
+    for (const node of new Set(nodes.values())) {
         const ancestors = new Set([node.issue.key]);
         let parent = node.issue.parentKey, cycle = false;
         while (parent && nodes.has(parent)) {

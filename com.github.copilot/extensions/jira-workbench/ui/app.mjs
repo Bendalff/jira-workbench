@@ -2,7 +2,7 @@ import { scopeKey, descendants, progressRollup, freshnessTone, jiraFreshness } f
 import {
     humanize, sourceFreshness, freshnessSummary, sessionState, sessionsBadge, launchState, launchBlocks, launchLabel, requestOutcome,
     receiptMessage, launchUpdate, primaryReason, executionEvidence, matches, filterTree, descendantSessionCounts, defaultMode,
-    signInNeeded, standaloneHost, banner, statusFilterGroups, sprintOptions, appliedSprint, smartCommitOption,
+    signInNeeded, standaloneHost, banner, statusFilterGroups, sprintOptions, appliedSprint, smartCommitOption, workingSetSummary, childLoadState,
 } from "/view-model.mjs";
 
 const $ = id => document.getElementById(id);
@@ -28,6 +28,32 @@ const initialPreferenceEdits = new Set();
 const disclosures = new Map(), linkDrafts = new Map(), submittedPreviews = new Set();
 const connectionMessages = new Map();
 const executionRefreshes = new Map();
+let visibleTimer, visibleSignature = "";
+const visibleIds = new Set();
+const visibleObserver = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+        const id = entry.target.dataset.nodeId;
+        if (entry.isIntersecting) visibleIds.add(id); else visibleIds.delete(id);
+    }
+    queueVisibleItems();
+}, { root: $("work-scroll") });
+
+function queueVisibleItems() {
+    clearTimeout(visibleTimer);
+    const key = state.workingSetKey, epoch = scopeEpoch;
+    if (!key || selecting) return;
+    visibleTimer = setTimeout(async () => {
+        const nodeIds = [...new Set([ui.selected, ...visibleIds].filter(Boolean))].slice(0, 100);
+        const signature = JSON.stringify([key, nodeIds]);
+        if (signature === visibleSignature || epoch !== scopeEpoch) return;
+        try {
+            await api("visible", { workingSetKey: key, nodeIds });
+            if (epoch === scopeEpoch) { visibleSignature = signature; connectionMessage("visible", ""); }
+        } catch (error) {
+            if (epoch === scopeEpoch) connectionMessage("visible", `Visible-item evidence selection could not be saved: ${error.message}`);
+        }
+    }, 100);
+}
 
 function el(tag, text, className) {
     const element = document.createElement(tag);
@@ -98,6 +124,14 @@ async function api(path, input, signal) {
         throw error;
     }
     return result;
+}
+async function loadPageAction(path, input) {
+    const snapshot = await api(path, input);
+    if (snapshot.pageError) {
+        acceptSnapshot(snapshot);
+        throw new Error(snapshot.pageError);
+    }
+    return snapshot;
 }
 function refreshExecution(source = "all", epoch = scopeEpoch, afterCurrent = false) {
     const key = `${epoch}:${source}`;
@@ -190,6 +224,7 @@ function flushPreferences() {
 function acceptSnapshot(snapshot, { allowScopeChange = false } = {}) {
     if (!snapshot || !Array.isArray(snapshot.issues)) throw new Error("The workbench returned an invalid snapshot.");
     const changedScope = snapshot.scope !== state.scope;
+    const changedWorkingSet = state.workingSetKey && snapshot.workingSetKey !== state.workingSetKey;
     const hasInitialEdits = !state.scope && initialPreferenceEdits.size > 0;
     if (changedScope && state.scope && !allowScopeChange) {
         scopeConfirmed = false;
@@ -225,6 +260,12 @@ function acceptSnapshot(snapshot, { allowScopeChange = false } = {}) {
     }
     scopeConfirmed = true;
     connectionMessage("scope", "");
+    if (changedWorkingSet) {
+        closePreview();
+        ui.selected = null;
+        collapsed.clear();
+        treeDigest = inspectorDigest = "";
+    }
     if (preview && state.mapping?.id !== snapshot.mapping?.id) markPreviewDirty();
     state = { ...snapshot, executions: snapshot.executions || [], navigationReceipts: snapshot.navigationReceipts || [] };
     reconcileReceipts();
@@ -412,6 +453,7 @@ function chooseItem(id) {
     tab = "trace";
     savePreferences("selected", "detailsOpen");
     render({ force: true });
+    queueVisibleItems();
     if (matchMedia("(max-width: 1000px)").matches) $("back-to-work").focus({ preventScroll: true });
 }
 function render({ force = false } = {}) {
@@ -422,6 +464,17 @@ function render({ force = false } = {}) {
     selectOptions($("repository"), state.appProjects.map(p => ({ value: p.id, label: p.repo || p.name })), state.mapping?.id, "Choose a Copilot repository");
     renderStatusFilter();
     renderSprintFilter();
+    const scopeSignature = JSON.stringify(state.scopeDraft);
+    if ($("scope-kind").dataset.signature !== scopeSignature) {
+        $("scope-kind").dataset.signature = scopeSignature;
+        $("scope-kind").value = state.scopeDraft?.kind || "project";
+        $("scope-value").value = state.scopeDraft?.value || "";
+    }
+    $("scope-value").disabled = $("scope-kind").value === "project" || selecting || !state.project;
+    $("scope-kind").disabled = $("apply-scope").disabled = selecting || !state.project;
+    $("scope-summary").textContent = state.project ? workingSetSummary(state) : "Choose a project to load a working set.";
+    $("load-more").hidden = !state.page?.nextPageToken;
+    configureActionControl($("load-more"), "load-more", "working-set", selecting || !state.project);
     configureActionControl($("project-start"), "prepare", "project", !state.project || !state.mapping || state.cached);
     configureActionControl($("sync-jira"), "launch", "project", selecting || !state.project || !state.mapping || Boolean(state.error) || state.cached || nodePending("project"));
     configureActionControl($("refresh"), "refresh-jira", "jira", selecting || !state.project);
@@ -446,11 +499,11 @@ function render({ force = false } = {}) {
         $("errors").replaceChildren(...errors.map(message => el("p", message)));
     }
     $("errors").hidden = !errors.length;
-    const work = state.issues.filter(i => i.level <= 0);
+    const work = state.issues.filter(i => !i.contextOnly && i.level <= 0);
     const allLinks = ["project", ...state.issues.map(item => item.id)].map(nodeLinks);
     const metrics = [
-        [state.issues.filter(i => i.level > 0).length, "Epics / parents"],
-        [work.length, "Work items"],
+        [state.issues.filter(i => !i.contextOnly && i.level > 0).length, "Loaded parents"],
+        [work.length, "Loaded work items"],
         [work.filter(i => i.category === "done").length, "Jira done"],
         [new Set(allLinks.flatMap(trace => trace.sessions.map(s => s.id))).size, "Linked sessions"],
         [new Set(allLinks.flatMap(trace => trace.prs.map(p => `${p.repo}#${p.number}`))).size, "Pull requests"],
@@ -544,6 +597,7 @@ function renderExecutionFilters() {
     restoreFocus($("execution-filters"), focus);
 }
 function primaryAction(item) {
+    if (item.contextOnly) return badge(item.missing ? "Unavailable parent" : item.expandedChild ? "Additional child context" : "Context-only ancestor");
     const primary = executionFor(item.id).primary || { kind: "inspect", label: "Inspect work" };
     const label = primary.label || "Inspect work";
     if (primary.kind === "prepare") {
@@ -633,10 +687,12 @@ function refreshSourceButton(label, source = "all", nodeId) {
 }
 function renderTree(force = false) {
     const container = $("tree");
-    const signature = JSON.stringify([ui.view, ui.executionFilter, ui.query, ui.category, sprintFilter(), ui.selected, [...collapsed], state.issues, state.tree, state.executions, state.links, state.requests, state.mapping, selecting, scopeConfirmed]);
+    const signature = JSON.stringify([ui.view, ui.executionFilter, ui.query, ui.category, sprintFilter(), ui.selected, [...collapsed], state.issues, state.tree, state.executions, state.links, state.requests, state.mapping, state.childPages, state.loadingPages, selecting, scopeConfirmed]);
     if (!force && (container.contains(document.activeElement) || signature === treeDigest)) return;
     const focus = captureFocus(container);
     treeDigest = signature;
+    visibleObserver.disconnect();
+    visibleIds.clear();
     container.replaceChildren();
     container.setAttribute("role", ui.view === "hierarchy" ? "tree" : "list");
     container.setAttribute("aria-label", ui.view === "hierarchy" ? "Jira work hierarchy" : "Daily execution queue");
@@ -699,6 +755,15 @@ function renderTree(force = false) {
                 name.append(toggle);
             } else name.append(el("span", "", "toggle-placeholder"));
             name.append(itemName(item, node));
+            const childLabel = childLoadState(item, state.childPages?.[item.id]);
+            if (childLabel) {
+                const childPage = state.childPages?.[item.id];
+                name.append(actionButton(childLabel, "children", item.id, item.id,
+                    () => loadPageAction("children", { nodeId: item.id }), {
+                        className: "child-load", disabled: Boolean(childPage && !childPage.nextPageToken),
+                        refresh: true, success: "Child page loaded as context only.",
+                    }));
+            }
             const status = el("div");
             status.append(badge(item.status, item.category));
             const progress = el("div", null, "progress-cell");
@@ -720,7 +785,9 @@ function renderTree(force = false) {
         : state.issues.length ? "No matching work in this view. Choose All work or clear the search, Jira status and sprint filters." : "No visible issues in this project.", "empty"));
     if (!rows.some(row => row.dataset.nodeId === focusedNode)) focusedNode = rows.find(row => row.dataset.nodeId === ui.selected)?.dataset.nodeId || rows[0]?.dataset.nodeId;
     rows.forEach(row => { row.tabIndex = row.dataset.nodeId === focusedNode ? 0 : -1; });
-    $("work-count").textContent = `${rows.length} visible work scope${rows.length === 1 ? "" : "s"}`;
+    $("work-count").textContent = `${rows.length} visible loaded item${rows.length === 1 ? "" : "s"}`;
+    rows.forEach(row => visibleObserver.observe(row));
+    queueVisibleItems();
     $("work-scroll").scrollTop = ui.scrollTop;
     restoreFocus(container, focus);
 }
@@ -728,7 +795,8 @@ function itemName(item, node, compact = false) {
     const title = el("div", null, "item-title");
     const meta = el("div", null, "item-keyline");
     meta.append(el("span", (item.type || "Work").slice(0, 1), `type-icon ${item.level > 0 ? "epic" : item.level < 0 ? "subtask" : "story"}`), el("span", item.key, "issue-key"));
-    if (item.level > 0 || item.id === "project") meta.append(el("small", compact ? item.type : item.id === "project" ? "Project scope" : "Parent scope", "muted"));
+    if (item.level > 0 || item.id === "project") meta.append(el("small", item.id === "project" ? "Project scope" : item.type, "muted"));
+    if (item.contextOnly) meta.append(badge(item.missing ? "Missing / restricted" : "Context only"));
     const summary = el("span", item.summary, "summary");
     if (compact) {
         const line = el("div", null, "execution-title");
@@ -737,7 +805,7 @@ function itemName(item, node, compact = false) {
         title.append(line);
     } else title.append(meta, summary);
     if (item.parentKey && !compact) title.append(el("small", `In ${item.parentKey}`));
-    if (node?.total) title.append(el("small", `${node.done}/${node.total} descendant items Jira done`));
+    if (node?.total) title.append(el("small", `${node.done}/${node.total} loaded descendant items Jira done`));
     return title;
 }
 function appendCompactObserved(container, nodeId) {
@@ -882,7 +950,7 @@ function renderInspector(force = false) {
     const primary = execution.primary;
     if (primary && primary.kind !== "prepare" && primary.kind !== "inspect") tools.append(primaryAction(item));
     tools.append(actionButton(trace.sessions.length ? "Start follow-up" : "Start session", "prepare", item.id, item.id,
-        context => preparePreview(item.id, defaultMode(item, execution), context), { className: "primary", disabled: !state.mapping, success: "Session scope ready for review." }),
+        context => preparePreview(item.id, defaultMode(item, execution), context), { className: "primary", disabled: !state.mapping || item.contextOnly, success: "Session scope ready for review." }),
     link("Open in Jira", itemUrl(item), "button-link"));
     head.append(tools, feedbackFor(item.id));
     const tabs = el("div", null, "tabs");
@@ -1237,6 +1305,27 @@ function selectProject(cloudId, jiraProjectId) {
     });
 }
 
+$("scope-kind").addEventListener("change", () => { $("scope-value").disabled = $("scope-kind").value === "project"; });
+$("apply-scope").addEventListener("click", async () => {
+    if (selecting || !state.project) return;
+    closePreview();
+    selecting = true;
+    const epoch = ++scopeEpoch;
+    snapshotVersion++;
+    render();
+    try {
+        const snapshot = await api("scope", { kind: $("scope-kind").value, value: $("scope-value").value });
+        if (epoch === scopeEpoch) { acceptSnapshot(snapshot); connectionMessage("apply-scope", ""); }
+    } catch (error) {
+        if (epoch === scopeEpoch) connectionMessage("apply-scope", `Scope was not applied: ${error.message}`);
+    } finally {
+        if (epoch === scopeEpoch) { selecting = false; render({ force: true }); queueVisibleItems(); }
+    }
+});
+$("load-more").addEventListener("click", () => void perform({
+    kind: "load-more", target: "working-set", label: "Load more", work: () => loadPageAction("load-more", {}), refresh: true,
+    success: "Working-set page loaded.",
+}));
 $("search").addEventListener("input", () => { ui.query = $("search").value; savePreferences("query"); renderExecutionFilters(); renderTree(true); paintFeedback(); });
 $("status-filter").addEventListener("change", () => { ui.category = $("status-filter").value; savePreferences("category"); renderExecutionFilters(); renderTree(true); paintFeedback(); });
 $("sprint-filter").addEventListener("change", () => { ui.sprint = $("sprint-filter").value || "all"; savePreferences("sprint"); renderExecutionFilters(); renderTree(true); paintFeedback(); });

@@ -111,12 +111,13 @@ export class Trace {
     async refreshExecution({ source = "all" } = {}) {
         const wb = this.workbench;
         if (!["all", "sessions", "github"].includes(source)) throw new Error("Choose a supported execution source.");
-        const scope = wb.selectedScope(), key = `${scope}/${source}`;
+        const scope = wb.selectedScope(), key = `${wb.loadKey()}/${wb.refreshGeneration}/${source}`;
         if (wb.executionRefreshes.has(key)) return wb.executionRefreshes.get(key);
         const pending = (async () => {
             const data = await wb.store.read();
-            const targets = ["project", ...wb.issues.map(i => i.id)]
-                .map(nodeId => wb.selectedScope(nodeId))
+            const ids = wb.evidenceNodes ? [...wb.evidenceNodes] : ["project", ...wb.issues.filter(issue => !issue.contextOnly).slice(0, 99).map(i => i.id)];
+            const targets = ids.slice(0, 100)
+                .map(nodeId => scope.replace(/\/project$/, `/${encodeURIComponent(nodeId)}`))
                 .filter(scope => data.links[scope])
                 .map(scope => ({ scope, previous: data.links[scope] }));
             const linkedSessions = targets.some(target => target.previous.sessions.length);

@@ -4,6 +4,19 @@ import { REQUEST_TTL_MS, jiraFreshness, requestStatus } from "./model.mjs";
 
 export const humanize = value => String(value || "unknown").replace(/[_-]/g, " ");
 
+export function workingSetSummary({ issues = [], page = {}, childPages = {}, fetchedAt, cached }) {
+    const loaded = issues.filter(issue => !issue.contextOnly).length;
+    const context = issues.filter(issue => issue.contextOnly).length;
+    const complete = Boolean(fetchedAt) && !cached && !page.nextPageToken;
+    const children = Object.values(childPages).reduce((sum, entry) => sum + entry.loaded, 0);
+    return `${loaded} scope items loaded${page.total == null ? "" : ` of ${page.total} matching`}; ${context} context items${children ? ` (${children} child rows read)` : ""}. ${page.nextPageToken ? "More scope results remain." : complete ? "All scope pages loaded." : "Scope not yet verified."} Counts and progress describe loaded items, not complete child totals.`;
+}
+
+export function childLoadState(item, page) {
+    if (item.missing || item.level < 0 || item.id === "project") return null;
+    return !page ? "Load children" : page.nextPageToken ? `Load more children (${page.loaded} read)` : `All ${page.loaded} immediate children read`;
+}
+
 // Freshness of one live source across some traces. `time` formats a timestamp for display.
 export function sourceFreshness(traces, source, time) {
     const linked = traces.filter(trace => source === "sessions" ? trace.sessions.length : trace.prs.length);
@@ -231,6 +244,8 @@ export function banner(snapshot, { now = Date.now(), unavailable = [] } = {}) {
     const signIn = signInNeeded(snapshot), connection = snapshot.connection;
     const data = [
         ...snapshot.tree.warnings,
+        ...(snapshot.ancestorWarnings || []),
+        ...(snapshot.pageError ? [snapshot.pageError] : []),
         ...(unavailable.length ? [`Execution snapshot references unavailable work items: ${unavailable.join(", ")}. Refresh the workbench to reconcile the sources.`] : []),
     ];
     if (standaloneHost(snapshot))

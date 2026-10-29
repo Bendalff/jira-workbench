@@ -40,7 +40,8 @@ condensed version.
 3. Pick a Jira site and project, then select its Copilot repository independently.
    A Jira project ID is **not** a Copilot project ID.
 4. Use **Execution** for the next useful action, or **Hierarchy** for project
-   structure. All project work is included, whether or not it is in a sprint.
+   structure. Apply a project, JQL or saved-filter scope and page through its
+   work explicitly, whether or not it is in a sprint.
 5. Select an item to inspect requirements, dependencies, and trace links.
    Select the project title to inspect project-level coordination sessions.
 6. Use a preparation action to review scope, repository, objective, acceptance
@@ -56,6 +57,54 @@ brief. Issue briefs also offer an opt-in **Smart Commit comment**; see
 
 Every launch requests exactly one session, nested under the canvas-owning
 session; there is no automatic child fan-out.
+
+### Working scopes and bounded reads
+
+The default server scope is the selected project, ordered by key. **Scope**
+also accepts JQL or a numeric saved Jira filter ID. JQL and filter scopes are
+intersected with the selected project; **Apply** persists the definition in
+the project's preferences. **Search loaded items**, status and sprint
+filters remain client-side controls. They cannot discover unloaded matches.
+
+Each working-set read requests at most 100 items and returns Jira's actual
+continuation. **Load more** appends one page; it never crawls to a size cap.
+Page failures preserve the loaded set and cursor, with an explicit error.
+**Refresh** replaces the working set with a new first page only after a
+successful read. Cached data stays marked as cached until revalidated.
+
+Referenced ancestor keys or IDs are deduplicated and read in batches of 50
+without the working scope's constraints, recursively up to 32 levels.
+Cycle protection uses stable IDs and keys. These reads retrieve only the
+referenced parents, not their children. Jira's hierarchy metadata determines
+type and level, including custom names such as Feature at level one.
+Missing or restricted parents have visible placeholders; failed ancestor
+reads and the depth safety limit are reported rather than hiding useful work.
+
+**Load children** explicitly reads one page of immediate children of that
+item, even when it is a cross-project contextual parent. Additional children
+and ancestors are labeled context only and cannot launch sessions. They do
+not increase scope totals or execution-queue counts. A later working-set
+page can promote a matching context item to work. All progress and descendant
+metrics describe loaded items, never complete child totals.
+
+Working-set caches include site, project and scope definition. Generation
+guards reject late scope, refresh and child responses, including an A-B-A
+scope switch. Project mappings, trace links and queued launch identities
+keep their existing site/project/issue keys. Changing scope invalidates
+brief previews but does not delete durable artifacts or requests.
+
+Periodic evidence refresh reads at most 100 visible or selected loaded item
+traces. Before the UI reports visibility, it uses at most the first 99 work
+items and the project node. Explicit item trace refresh is unchanged.
+
+Canvas automation can use `set_scope` with `{ kind, value }` to edit the draft,
+then `apply_scope` with empty input, or pass the definition directly to
+`apply_scope`. Supported kinds are `project`, `jql` and `filter`.
+`load_more` advances the working-set cursor; `load_children` accepts
+`{ nodeId }` and advances only that parent's cursor. `get_state` returns
+`workingScope`, `scopeDraft`, `workingSetKey`, `page`, `childPages`,
+`pageError` and `ancestorWarnings`. `set_visible_items` accepts
+`{ workingSetKey, nodeIds }` with at most 100 loaded IDs.
 
 Existing sessions can be opened, explicitly linked by app session ID, or followed
 by a new session. Linking checks the session's Copilot project before saving it.
@@ -505,8 +554,10 @@ verification artifacts.
 - GitHub.com repositories only; GitHub Enterprise Server is not yet supported.
 - One default Copilot repository mapping per Jira project; explicit historical
   session links retain their original repository metadata.
-- Project loading stops with an explicit error above 10,000 issues; session
-  previews require a scope of at most 500 descendants.
+- Each page is bounded, but explicitly loading many pages still grows the
+  panel's in-memory working set. Jira must return a usable continuation when
+  more results remain. Session previews require at most 500 loaded descendants;
+  they do not imply that every child has been loaded.
 - Launches are agent-mediated and need the canvas-owning session to process them.
   If creation fails, record the error with `fail_request`; never retry an
   uncertain creation blindly. A request with no receipt after 15 minutes is shown
