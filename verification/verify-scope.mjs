@@ -23,13 +23,6 @@ gateway.issues = async (site, project, options) => {
     return { issues: [task], total: 2, nextPageToken: "page-two", fetchedAt: new Date().toISOString() };
 };
 gateway.ancestors = async () => ({ issues: [feature, portfolio], warnings: [] });
-gateway.children = async (site, parent, options) => {
-    calls.push({ kind: "children", id: parent.id, cursor: options.cursor });
-    return options.cursor ? { issues: [], nextPageToken: null, total: 1 } : {
-        issues: [{ ...issues[7], id: "103", key: "TEAM-103", parentKey: feature.key, projectId: "45", level: 0, summary: "Other team child" }],
-        nextPageToken: "children-two", total: 1,
-    };
-};
 await workbench.catalog();
 await workbench.select({ cloudId: "demo-site", jiraProjectId: "42" });
 await workbench.idle();
@@ -44,7 +37,6 @@ try {
     await page.getByLabel("Search loaded items", { exact: true }).waitFor();
     await page.waitForFunction(() => document.getElementById("scope-summary").textContent.includes("1 scope items loaded of 2"));
     assert.equal(calls.filter(call => call.kind === "scope").length, 1, "initial load does not crawl");
-    assert.equal(calls.filter(call => call.kind === "children").length, 0);
     await page.locator("#scope-kind").selectOption("jql");
     await page.locator("#scope-value").fill("assignee = currentUser()");
     assert.equal(calls.filter(call => call.kind === "scope").length, 1, "editing scope does not read Jira");
@@ -83,18 +75,9 @@ try {
     await page.locator("#view-hierarchy").click();
     await page.getByRole("treeitem", { name: /PARENT-101 Cross-project feature/ }).waitFor();
     await page.getByRole("treeitem", { name: /PORT-102 Portfolio context/ }).waitFor();
-    assert.equal(calls.filter(call => call.kind === "children").length, 0, "rendering context never fetches children");
     const featureRow = page.getByRole("treeitem", { name: /PARENT-101 Cross-project feature/ });
     assert.match(await featureRow.innerText(), /Context only/);
-    await featureRow.getByRole("button", { name: "Load children", exact: true }).click();
-    await page.getByRole("treeitem", { name: /TEAM-103 Other team child/ }).waitFor();
-    assert.equal(calls.filter(call => call.kind === "children").length, 1);
-    assert.equal(workbench.page.loaded, 2, "context children do not inflate working-set counts");
-    assert.equal(await featureRow.getByRole("button", { name: /Load more children/ }).evaluate(element => element === document.activeElement), true, "child paging restores the replacement button");
-    await featureRow.getByRole("button", { name: /Load more children/ }).click();
-    await featureRow.getByRole("button", { name: "All 1 immediate children read", exact: true }).waitFor();
-    assert.equal(calls.filter(call => call.kind === "children").length, 2);
-    await page.waitForFunction(() => document.activeElement?.getAttribute("role") === "treeitem");
+    assert.match(await featureRow.getAttribute("aria-label"), /, Context only$/, "screen readers hear the context label");
     await featureRow.click();
     await page.getByText("Select this item's own Jira project to view, link or refresh", { exact: false }).waitFor();
     assert.equal(await page.getByRole("button", { name: "Link session", exact: true }).count(), 0);
@@ -103,7 +86,6 @@ try {
     await page.locator("#apply-scope").click();
     await page.waitForFunction(() => !document.getElementById("apply-scope").disabled);
     assert.deepEqual(workbench.workingScope, { kind: "filter", value: "123" });
-    assert.ok(!workbench.issues.some(issue => issue.id === "103"), "scope switches drop expanded context");
 
     // A delayed failed response must not restore the former scope after Apply.
     const oldPageEntered = deferred(), oldPageRelease = deferred();
@@ -121,18 +103,13 @@ try {
     await page.locator("#scope-value").fill("456");
     await page.locator("#apply-scope").click();
     await page.waitForFunction(() => !document.getElementById("apply-scope").disabled);
+    assert.equal(await page.locator("#load-more").isDisabled(), false, "a Load more pending for the replaced scope does not block the new one");
     oldPageRelease.resolve();
     await page.waitForResponse(response => response.url().endsWith("/api/load-more"));
     await page.unroute("**/api/load-more");
     assert.equal(await page.locator("#scope-value").inputValue(), "456");
     assert.doesNotMatch(await page.locator("#errors").innerText(), /Old delayed/);
 
-    const visibility = [];
-    page.on("request", request => { if (request.url().endsWith("/api/visible")) visibility.push(request.postDataJSON()); });
-    await page.locator("#apply-scope").click();
-    await page.waitForFunction(() => !document.getElementById("apply-scope").disabled);
-    await page.waitForRequest(request => request.url().endsWith("/api/visible"));
-    assert.ok(visibility.some(input => input.generation === workbench.refreshGeneration && input.revision > 0), "same-scope apply sends versioned visibility again");
 
     // Superseding Apply clears its status, without clearing the project's saved selection/collapse state.
     await page.locator("#view-hierarchy").click();
@@ -196,39 +173,6 @@ try {
     assert.doesNotMatch(await page.locator("#notice").innerText(), /Working-set page loaded/);
     gateway.issues = readIssues;
 
-    // A -> B (still in flight) -> A must send a newer report even though A was acknowledged.
-    await page.reload();
-    await page.waitForFunction(() => document.getElementById("scope-value").value === "456");
-    await page.locator("#view-hierarchy").click();
-    // Expanding PARENT-101 at the previous step may or may not have been saved before this reload; only visibility matters.
-    await featureRow.getByRole("button", { name: /^(Expand|Collapse) PARENT-101$/ }).waitFor();
-    const expandFeature = featureRow.getByRole("button", { name: "Expand PARENT-101", exact: true });
-    if (await expandFeature.count()) await expandFeature.click();
-    await page.getByRole("treeitem", { name: /DEMO-2 Scoped task/ }).waitFor();
-    await page.getByRole("treeitem", { name: /PORT-102 Portfolio context/ }).click();
-    await page.waitForRequest(request => request.url().endsWith("/api/visible") && request.postDataJSON().nodeIds.includes(task.id));
-    const bEntered = deferred(), releaseB = deferred();
-    let bRevision;
-    await page.route("**/api/visible", async route => {
-        const input = route.request().postDataJSON();
-        const response = await route.fetch();
-        if (!input.nodeIds.includes(task.id)) {
-            bRevision = input.revision;
-            bEntered.resolve();
-            await releaseB.promise;
-        }
-        await route.fulfill({ response });
-    });
-    await page.locator("#search").fill("Portfolio context");
-    await bEntered.promise;
-    const restoredA = page.waitForResponse(response => response.url().endsWith("/api/visible")
-        && response.request().postDataJSON().revision > bRevision && response.request().postDataJSON().nodeIds.includes(task.id));
-    await page.locator("#search").fill("");
-    await restoredA;
-    releaseB.resolve();
-    await page.unroute("**/api/visible", { behavior: "wait" });
-    assert.ok(workbench.evidenceNodes.has(task.id), "returning to A supersedes in-flight B");
-
     // A pending request on an issue outside the loaded pages stays visible after Refresh, labeled as linked work.
     await store.update(data => {
         data.requests["linked-request"] = { requestId: "linked-request", kind: "launch", scope: scope.replace(/project$/, "3"), nodeId: "3",
@@ -236,14 +180,14 @@ try {
     });
     gateway.lookupIssues = async (site, project, ids) => issues.filter(issue => ids.includes(issue.id));
     await page.locator("#refresh").click();
-    const linkedRow = page.getByRole("treeitem", { name: /DEMO-3 Running with a PR/ });
+    const linkedRow = page.getByRole("treeitem", { name: /DEMO-3 Running with a PR, Jira To Do, Linked, outside scope/ });
     await linkedRow.waitFor();
     assert.match(await linkedRow.innerText(), /Linked, outside scope/);
     await page.waitForFunction(() => document.getElementById("scope-summary").textContent.includes("1 linked items outside the loaded pages"));
     assert.ok((await workbench.snapshot()).executions.some(execution => execution.nodeId === "3"), "pending work stays in the execution queue");
     await page.screenshot({ path: screenshotPath("scoped-loading.png") });
     assert.deepEqual(errors, []);
-    console.log("PASS: transactional scopes, bounded pages/retry, cross-project hierarchy and trace isolation, lazy children, stale/superseded page outcomes, versioned same-scope and A-B-A visibility, restored per-project selection/collapse and drafts, accurate failed/superseded Apply status, stable live summaries, linked work outside the loaded pages, and keyboard focus. All services were synthetic; no Jira writes.");
+    console.log("PASS: transactional scopes, bounded pages/retry, cross-project hierarchy and trace isolation, stale/superseded page outcomes, per-generation Load more, restored per-project selection/collapse and drafts, accurate failed/superseded Apply status, stable live summaries, linked work outside the loaded pages, and keyboard focus. All services were synthetic; no Jira writes.");
 } finally {
     await browser.close();
     await server.close();

@@ -165,34 +165,30 @@ closed or cross-project context. Types and levels come from Jira metadata,
 so a level-one **Feature** need not be named **Epic**. Context-only ancestors
 are labeled and cannot launch work. Missing, restricted or unavailable
 parents appear as placeholders; parent lookup failures are reported.
-Transient parent failures can retry on later explicit page reads.
+A parent lookup that fails is retried on the next **Load more**.
 Authentication or connection failures also activate the normal sign-in or
 recovery state without hiding items already read.
 
-Use an item's **Load children** button to explicitly expand its immediate
-children, then **Load more children** for another page. These additional
-items are context only, may belong to another project, and do not increase
-the working-set count. Merely displaying or expanding loaded tree rows never
-crawls another team's siblings or descendants. To launch a context item,
-select its own project and include it in that project's working scope.
-Foreign-project context also has no trace or Link session controls: select
-its owning project to use the correct repository mapping and durable links.
+Parents are read only to show where loaded work sits; their other children
+are never read. To launch a context item, select its own project and include
+it in that project's working scope. Foreign-project context also has no trace
+or Link session controls: select its owning project to use the correct
+repository mapping and durable links.
 
-Periodic session and PR evidence reads are limited to at most 100 visible or
-selected loaded items, with one periodic slot reserved for linked project
-sessions. When 100 issue traces are visible as well, periodic reads rotate
-the remaining issue into the next poll. Newly visible items refresh their
-session metadata before reading PR evidence, including newly created PRs.
-Selecting an item in
-the current project and using its trace refresh still verifies that item
-directly. Durable links and repository mappings are not deleted when you
-change scope.
+Session and PR evidence is read for every linked item of the selected project,
+as before scoped loading. Durable links and repository mappings are not deleted
+when you change scope.
+
+When the working scope is not the whole project, or more pages remain, a
+session brief for the project or a parent includes only the loaded
+descendants. The preview warns about this, so **Implement** needs that warning
+acknowledged, and the session's kickoff says the descendant list is incomplete.
 
 **Update Jira** remains project-wide, not limited to the loaded scope. It
-includes durable session and PR links for up to 300 issues, resolving
-unloaded issue identities separately. Missing, restricted or over-limit
-identities are explicitly reported as omitted evidence for the sync session
-to verify, not as evidence that no work exists.
+includes durable session and PR links for up to 300 linked issues, which are
+always loaded. Linked issues the canvas could not load, or that exceed the
+limit, are reported as omitted evidence for the sync session to verify, not
+as evidence that no work exists.
 
 ---
 

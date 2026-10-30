@@ -73,7 +73,7 @@ export class Trace {
         const detail = await wb.gateway.call("get_session", { project_session_id: sessionId });
         if (detail.project_id !== projectId) throw new Error("The session belongs to a different Copilot project than the selected repository.");
         const record = sessionRecord(detail, sessionId);
-        await wb.store.update(data => {
+        await wb.commit(data => {
             const link = data.links[scope] ||= { sessions: [], prs: [] };
             const index = link.sessions.findIndex(s => s.id === record.id);
             if (requestId) record.contextHash = data.requests[requestId].contextHash;
@@ -110,29 +110,19 @@ export class Trace {
         const owner = link.sessions.find(s => s.prNumber === number && s.prRepo?.toLowerCase() === repo.toLowerCase());
         return wb.hostActions.openPr(repo, number, owner ? { sessionId: owner.id } : {});
     }
-    async refreshExecution({ source = "all", nodeIds = null } = {}) {
+    async refreshExecution({ source = "all" } = {}) {
         const wb = this.workbench;
         if (!["all", "sessions", "github"].includes(source)) throw new Error("Choose a supported execution source.");
         const scope = wb.selectedScope(), generation = wb.refreshGeneration;
-        if (nodeIds && (!Array.isArray(nodeIds) || nodeIds.length > 100)) throw new Error("Provide at most 100 loaded evidence targets.");
-        const ids = nodeIds || (wb.evidenceNodes ? [...wb.evidenceNodes] : wb.issues.filter(issue => !issue.contextOnly).slice(0, 99).map(i => i.id));
-        const key = `${wb.loadKey()}/${generation}/${source}/${JSON.stringify(ids)}`;
+        const key = `${wb.loadKey()}/${generation}/${source}`;
         if (wb.executionRefreshes.has(key)) return wb.executionRefreshes.get(key);
         const pending = (async () => {
             const data = await wb.store.read();
             if (generation !== wb.refreshGeneration || scope !== wb.currentScope()) return wb.snapshot();
-            const loaded = new Set(wb.issues.filter(issue => !issue.projectId || issue.projectId === wb.project.id).map(issue => issue.id));
-            const linkedIds = [...new Set(ids)].filter(id => (id === "project" || loaded.has(id))
-                && data.links[scope.replace(/\/project$/, `/${encodeURIComponent(id)}`)]);
-            let selected = linkedIds;
-            if (!nodeIds && data.links[scope]) {
-                const items = linkedIds.filter(id => id !== "project");
-                const offset = (this.evidenceOffset || 0) % (items.length || 1);
-                selected = ["project", ...items.slice(offset), ...items.slice(0, offset)];
-                this.evidenceOffset = offset + 99;
-            }
-            const targets = selected.slice(0, 100)
-                .map(nodeId => scope.replace(/\/project$/, `/${encodeURIComponent(nodeId)}`))
+            // Only this project's own issues: cross-project context has no trace under this project's mapping.
+            const targets = ["project", ...wb.issues.filter(issue => issue.projectId === wb.project.id).map(issue => issue.id)]
+                .map(nodeId => wb.selectedScope(nodeId))
+                .filter(scope => data.links[scope])
                 .map(scope => ({ scope, previous: data.links[scope] }));
             const linkedSessions = targets.some(target => target.previous.sessions.length);
             // Polling only asks about sessions; with none linked there is nothing to observe or write.

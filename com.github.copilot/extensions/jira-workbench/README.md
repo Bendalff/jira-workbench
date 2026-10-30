@@ -88,12 +88,18 @@ Tracked issues are actionable work in the execution queue and hierarchy,
 labeled **Linked, outside scope**, and excluded from scope counts; a later page
 that returns one promotes it to a scope item. Lookup failures, unavailable
 identities and the limit are reported as warnings, never as an empty queue.
+When the lookup fails, linked items already loaded are kept; a classified
+connection failure marks the snapshot stale and skips the remaining reads so
+none can clear it. Requests and links committed while a first page is being
+read are reconciled before it is installed, so their issues are kept too.
 
 Referenced ancestor keys or IDs are deduplicated and read in batches of 50
 without the working scope's constraints, recursively up to 32 levels.
 Cycle protection uses stable IDs and keys. These reads retrieve only the
-referenced parents, not their children. Subsequent pages traverse only new
-references and remember missing parents for the current generation.
+referenced parents, not their children. **Load more** passes every loaded
+item as a seed, so parents an earlier page could not read (including the parent
+of a retained parent) are retried, while resolved parents and parents
+confirmed missing for the current generation are skipped.
 Failed batches remain retryable; authentication and connection failures
 also reach the connection supervisor while already read items stay visible
 as stale data.
@@ -102,50 +108,42 @@ type and level, including custom names such as Feature at level one.
 Missing or restricted parents have visible placeholders; failed ancestor
 reads and the depth safety limit are reported rather than hiding useful work.
 
-**Load children** explicitly reads one page of immediate children of that
-item, even when it is a cross-project contextual parent. Additional children
-and ancestors are labeled context only and cannot launch sessions. They do
-not increase scope totals or execution-queue counts. A later working-set
-page can promote a matching context item to work. All progress and descendant
-metrics describe loaded items, never complete child totals.
+Ancestors are labeled context only (also in each tree row's accessible name)
+and cannot launch sessions. They do not increase scope totals or
+execution-queue counts. A later working-set page can promote a matching
+context item to work. All progress and descendant metrics describe loaded
+items, never complete child totals. When the scope is not the whole project or
+more pages remain, project and parent briefs carry a `partial-context` warning
+and the kickoff states that the descendant list is incomplete.
 
 Working-set caches include site, project and scope definition. Generation
-guards reject late scope, refresh and child responses, including an A-B-A
-scope switch. Project mappings, trace links and queued launch identities
+guards reject late scope, refresh and page responses, including an A-B-A
+scope switch. A page that was installed before a later refresh started still
+reports `loaded`. Project mappings, trace links and queued launch identities
 keep their existing site/project/issue keys. Changing scope invalidates
 brief previews but does not delete durable artifacts or requests.
 
-Periodic evidence refresh reads at most 100 visible or selected loaded item
-traces. Before the UI reports visibility, it uses at most the first 99 work
-items and the project node. Periodic reads reserve a slot only for a linked
-project trace, rotating visible issue overflow into the next poll.
-Explicit target reads do not add unrelated project work.
-Newly visible targets refresh session metadata before GitHub evidence so
-new PRs are discovered; polling continues to refresh sessions.
-Foreign-project context cannot view, link or
+Execution evidence refresh reads every linked trace of the selected project's
+own loaded issues, as before scoped loading; its cost follows the number of
+linked items, not the project size. Items whose `projectId` is not the selected
+project, including context with no project metadata, cannot view, link or
 refresh traces using the selected project's mapping. Select its owning
 project to use those controls.
 
 Project-wide **Update Jira** gathers evidence from durable project links,
-independently of loaded scope pages. It resolves up to 300 linked issue
-identities and reports missing, restricted, moved or over-limit identities
-as omitted, never as absent work. Workflow status choices exclude foreign
-context items.
+independently of loaded scope pages. Linked issues are always loaded, so it
+uses the loaded rows for up to 300 of them and reports the rest as omitted,
+never as absent work. It reads the selected project's issues and statuses
+before any wait and rejects the sync if the project selection changed in the
+meantime, including a switch away and back. Workflow status choices exclude
+foreign context items.
 
-Canvas automation can use `set_scope` with `{ kind, value }` to edit the draft,
-then `apply_scope` with empty input, or pass the definition directly to
-`apply_scope`. Supported kinds are `project`, `jql` and `filter`.
-`load_more` advances the working-set cursor; `load_children` accepts
-`{ nodeId }` and advances only that parent's cursor. `get_state` returns
-`workingScope`, `scopeDraft`, `workingSetKey`, `workingSetGeneration`,
-`visibilityRevision`, `page`, `childPages`,
-`pageError` and `ancestorWarnings`. `set_visible_items` accepts
-`{ workingSetKey, generation, revision, nodeIds }` with at most 100 loaded
-IDs. Use the current `workingSetGeneration` as `generation` and a strictly
-increasing integer `revision` greater than the returned `visibilityRevision`.
-Old generations or revisions are rejected. Page actions also return a
+Canvas automation passes `{ kind, value }` to `apply_scope`. Supported kinds
+are `project`, `jql` and `filter`. `load_more` advances the working-set cursor.
+`get_state` returns `workingScope`, `workingSetKey`, `workingSetGeneration`,
+`page`, `pageError` and `ancestorWarnings`. `load_more` also returns a
 `pageResult` with the target, `loaded`, `failed` or `superseded` status and
-operation-specific error; `pageError` remains the combined banner.
+its error; `pageError` remains the combined banner.
 `scopeError` identifies the Apply error independently of other page errors,
 and Apply returns `applyResult.status` (`applied`, `failed` or `superseded`).
 Superseded page actions never announce a completed load.

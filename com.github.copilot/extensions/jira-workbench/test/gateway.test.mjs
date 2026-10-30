@@ -162,23 +162,7 @@ test("ancestor failures are explicit while already retrieved parents remain usef
     assert.match(result.warnings[0], /Parent lookup failed: Permission denied/);
 });
 
-test("children are one explicit parent-only page, with real continuation and no working-set constraints", async () => {
-    const calls = [];
-    const gateway = new Gateway(runtime((name, args) => {
-        calls.push(args);
-        assert.equal(args.jql, "parent = 1 ORDER BY key ASC");
-        return { issues: [issue("2", "TEAM-2", "PARENT-1")], nextPageToken: "children-next", isLast: false };
-    }));
-    const page = await gateway.children("site-a", { id: "1", key: "PARENT-1" });
-    assert.equal(calls.length, 1);
-    assert.equal(page.nextPageToken, "children-next");
-    assert.equal(calls[0].maxResults, 100);
-    assert.ok(!/project|assignee|component/.test(calls[0].jql));
-});
-
-test("missing completion metadata and unsupported child results fail explicitly", async () => {
-    const gateway = new Gateway(runtime(() => ({ issues: [issue("2", "DEMO-2", "PARENT-9")], isLast: true })));
-    await assert.rejects(gateway.children("site-a", { id: "1", key: "PARENT-1" }), /outside the requested parent/);
+test("missing completion metadata fails explicitly", async () => {
     const unknown = new Gateway(runtime(() => ({ issues: [issue("2", "DEMO-2")] })));
     await assert.rejects(unknown.issuePage("site-a", "project = 42"), /completion|continuation/);
 });
@@ -213,8 +197,10 @@ test("durable issue identity reads stay bounded and constrained to the selected 
         calls++;
         assert.match(args.jql, /^project = 42 AND id in/);
         assert.ok(args.jql.match(/,/g)?.length < 50 || !args.jql.includes(","));
+        assert.ok(args.fields.includes("customfield_10020"), "linked work keeps its sprint membership");
         return { issues: [], isLast: true };
     }));
+    gateway.sprintFields.set("site-a", "customfield_10020");
     await gateway.lookupIssues("site-a", "42", Array.from({ length: 123 }, (_, i) => String(i + 1)));
     assert.equal(calls, 3);
     await assert.rejects(gateway.lookupIssues("site-a", "42", ["bad"]), /numeric/);

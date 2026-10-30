@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_SCOPE, scopeJql, validateScope, workingSetKey, mergeIssues } from "../lib/scope.mjs";
-import { workingSetSummary, childLoadState } from "../lib/view-model.mjs";
+import { workingSetSummary, scopeLabel } from "../lib/view-model.mjs";
 import { buildTree, normalizeIssue, descendants } from "../lib/model.mjs";
 import { descendantSessionCounts } from "../lib/view-model.mjs";
 import { Workbench } from "../lib/workbench.mjs";
@@ -17,7 +17,6 @@ function fixture() {
     const gateway = {
         issues: async () => ({ issues: [row("1")], nextPageToken: "second", fetchedAt: "2026-01-01T00:00:00Z" }),
         ancestors: async () => ({ issues: [row("10", { key: "PARENT-10", projectId: "43", level: 1, type: "Feature", contextOnly: true })], warnings: [] }),
-        children: async () => ({ issues: [row("3", { parentKey: "DEMO-1" })], nextPageToken: "more-children" }),
     };
     const wb = new Workbench({ store, gateway });
     wb.site = { id: "demo-site", name: "Example", url: "https://example.atlassian.net" };
@@ -43,10 +42,10 @@ test("scope builds project-constrained server JQL without corrupting quoted ORDE
 test("scope is explicitly applied, durable and separate from project trace/mapping identities", async () => {
     const { wb, store } = fixture();
     const projectScope = wb.selectedScope();
-    await wb.setScope({ kind: "filter", value: "123" });
+    await assert.rejects(wb.applyScope({ kind: "filter", value: "12 OR 1=1" }), /numeric/);
     assert.deepEqual(wb.workingScope, DEFAULT_SCOPE);
     assert.equal(wb.issues.length, 0);
-    await wb.applyScope();
+    await wb.applyScope({ kind: "filter", value: "123" });
     assert.equal(wb.workingScope.value, "123");
     assert.equal(wb.selectedScope(), projectScope);
     assert.equal((await store.read()).preferences[projectScope].workingScope.value, "123");
@@ -97,7 +96,7 @@ test("scope-aware warm caches never mix pages and scope changes preserve durable
     assert.equal(reopened.cached, true);
 });
 
-test("late scope, refresh and child responses cannot mix working sets, including A-B-A switches", async () => {
+test("late scope, refresh and page responses cannot mix working sets, including A-B-A switches", async () => {
     const { wb, gateway } = fixture();
     const old = deferred(), entered = deferred();
     gateway.issues = async (site, project, options) => {
@@ -111,15 +110,16 @@ test("late scope, refresh and child responses cannot mix working sets, including
     await pending;
     assert.deepEqual(wb.issues.filter(issue => !issue.contextOnly).map(issue => issue.id), ["2"]);
     assert.equal(wb.page.nextPageToken, null);
-    const children = deferred();
-    gateway.children = () => children.promise;
-    const childLoad = wb.loadChildren({ nodeId: "2" });
+    const more = deferred();
+    gateway.issues = async (site, project, options) => options.cursor ? more.promise : { issues: [row("2")], nextPageToken: "next", fetchedAt: "new" };
+    await wb.applyScope({ kind: "jql", value: "new" });
+    const page = wb.loadMore();
     await wb.applyScope({ kind: "jql", value: "different" });
     await wb.applyScope({ kind: "jql", value: "new" });
-    children.resolve({ issues: [row("99")], nextPageToken: "old-children" });
-    await childLoad;
+    more.resolve({ issues: [row("99")], nextPageToken: null });
+    assert.equal((await page).pageResult.status, "superseded");
     assert.ok(!wb.issues.some(issue => issue.id === "99"));
-    assert.deepEqual(wb.childPages, {});
+    assert.equal(wb.page.nextPageToken, "next");
 });
 
 test("pages are explicit, share duplicate clicks and preserve useful data and cursor on failure", async () => {
@@ -151,28 +151,45 @@ test("pages are explicit, share duplicate clicks and preserve useful data and cu
     assert.equal(failed.stale, false, "a failed append does not invalidate already loaded Jira items");
 });
 
-test("referenced ancestors never expand siblings; explicit child expansion is paged and context-only", async () => {
-    const { wb, gateway } = fixture();
-    let reads = 0;
-    const original = gateway.children;
-    gateway.children = (...args) => { reads++; return original(...args); };
+test("referenced ancestors are context only until a scope page returns them", async () => {
+    const { wb } = fixture();
     await wb.refresh();
-    assert.equal(reads, 0);
-    await wb.loadChildren({ nodeId: "1" });
-    assert.equal(reads, 1);
-    assert.equal(wb.childPages["1"].nextPageToken, "more-children");
-    assert.equal(wb.issues.find(issue => issue.id === "3").contextOnly, true);
-    assert.equal(wb.page.loaded, 1, "child context does not inflate scope totals");
+    assert.equal(wb.issues.find(issue => issue.id === "10").contextOnly, true);
+    assert.equal(wb.page.loaded, 1, "context does not inflate scope totals");
     await assert.rejects(wb.prepare({ nodeId: "10" }), /context only/);
-    const promoted = mergeIssues(wb.issues, [row("3")]);
-    assert.equal(promoted.find(issue => issue.id === "3").contextOnly, undefined, "a later matching scope page promotes context to work");
-    assert.ok(mergeIssues(promoted, [row("3", { contextOnly: true })]).find(issue => issue.id === "3").contextOnly !== true);
-    gateway.children = async () => { throw new Error("Child lookup failed"); };
-    const failed = await wb.loadChildren({ nodeId: "1" });
-    assert.match(failed.pageError, /Child lookup failed/);
-    assert.equal(failed.childPages["1"].nextPageToken, "more-children");
-    assert.ok(failed.issues.some(issue => issue.id === "3"));
+    const promoted = mergeIssues(wb.issues, [row("10")]);
+    assert.equal(promoted.find(issue => issue.id === "10").contextOnly, undefined, "a later matching scope page promotes context to work");
+    assert.ok(mergeIssues(promoted, [row("10", { contextOnly: true })]).find(issue => issue.id === "10").contextOnly !== true);
 });
+
+for (const failing of [["PARENT-10", "PORT-20"], ["PORT-20"]]) {
+    test(`Load more retries parent lookups an earlier page could not complete (${failing.join(", ")})`, async () => {
+        const { wb } = fixture();
+        const gateway = new Gateway({});
+        gateway.issues = async (site, project, options) => options.cursor
+            ? { issues: [row("2")], nextPageToken: null, fetchedAt: "two" }
+            : { issues: [row("1", { parentKey: "PARENT-10" })], nextPageToken: "second", fetchedAt: "one" };
+        const parents = {
+            "PARENT-10": row("10", { key: "PARENT-10", projectId: "43", level: 1, parentKey: "PORT-20" }),
+            "PORT-20": row("20", { key: "PORT-20", projectId: "44", level: 2 }),
+        };
+        let outage = true;
+        gateway.issuePage = async (cloudId, jql) => {
+            const keys = [...jql.matchAll(/"([A-Z]+-\d+)"/g)].map(match => match[1]);
+            if (outage && keys.some(key => failing.includes(key))) throw new Error("Parent lookup outage");
+            return { issues: keys.map(key => parents[key]).filter(Boolean), nextPageToken: null };
+        };
+        wb.gateway = gateway;
+        await wb.refresh();
+        assert.ok(!wb.issues.some(issue => issue.key === "PORT-20"));
+        assert.ok(wb.ancestorWarnings.some(warning => /Parent lookup outage/.test(warning)));
+        outage = false;
+        await wb.loadMore();
+        assert.deepEqual(wb.issues.filter(issue => issue.contextOnly).map(issue => issue.key).sort(), ["PARENT-10", "PORT-20"],
+            "the unrelated second page still resolves the earlier failed chain");
+        assert.deepEqual(wb.ancestorWarnings, [], "a resolved retry clears the earlier failure");
+    });
+}
 
 test("repeated continuation cycles and overlapping refreshes cannot append stale pages", async () => {
     const { wb, gateway } = fixture();
@@ -208,17 +225,17 @@ test("missing and id-only parents use explicit placeholders; hierarchy names com
     assert.equal(resolved.roots[0].children[0].issue.id, "2");
 });
 
-test("loaded counts, paging and child-completeness labels do not imply complete project totals", async () => {
+test("loaded counts and row labels do not imply complete project totals", async () => {
     const { wb } = fixture();
     await wb.refresh();
     const state = await wb.snapshot();
     assert.match(workingSetSummary(state), /1 scope items loaded; 1 context items.*More scope results remain/);
     assert.match(workingSetSummary(state), /not complete child totals/);
     assert.equal(state.executions.length, 1, "ancestors do not become execution work");
-    assert.equal(childLoadState(row("1")), "Load children");
-    assert.equal(childLoadState(row("1"), { loaded: 2, nextPageToken: "next" }), "Load more children (2 read)");
-    assert.equal(childLoadState(row("1"), { loaded: 2, nextPageToken: null }), "All 2 immediate children read");
-    assert.equal(childLoadState(row("1", { level: -1 })), null);
+    assert.equal(scopeLabel(row("1")), "");
+    assert.equal(scopeLabel(row("1", { contextOnly: true })), "Context only");
+    assert.equal(scopeLabel(row("1", { contextOnly: true, missing: true })), "Missing / restricted");
+    assert.equal(scopeLabel(row("1", { tracked: true })), "Linked, outside scope");
 });
 
 test("linked and pending work stays in the execution queue when it is outside the loaded scope page", async () => {
@@ -251,6 +268,50 @@ test("linked and pending work stays in the execution queue when it is outside th
     assert.match(workingSetSummary(more), /2 scope items loaded; 1 context items; 1 linked items outside the loaded pages\./);
 });
 
+test("a failed linked-work lookup keeps loaded linked items, and a connection failure stays visible", async () => {
+    const { wb, gateway, store } = fixture();
+    await store.update(data => { data.links[wb.selectedScope("7")] = { sessions: [{ id: "session-7" }], prs: [] }; });
+    gateway.lookupIssues = async (cloudId, projectId, ids) => ids.map(id => row(id));
+    await wb.refresh();
+    assert.ok(wb.issues.some(issue => issue.id === "7" && issue.tracked));
+    gateway.lookupIssues = async () => { throw new Error("lookup outage"); };
+    let state = await wb.refresh();
+    assert.ok(state.issues.some(issue => issue.id === "7" && issue.tracked), "kept from the previous working set");
+    assert.ok(state.executions.some(execution => execution.nodeId === "7"));
+    assert.equal(state.error, null);
+    assert.ok(state.ancestorWarnings.some(warning => /Linked work lookup failed: lookup outage/.test(warning)));
+    gateway.lookupIssues = async () => { throw Object.assign(new Error("Jira connection lost"), { kind: "transient" }); };
+    let laterReads = 0;
+    gateway.ancestors = async () => { laterReads++; return { issues: [], warnings: [] }; };
+    gateway.statuses = async () => { laterReads++; return []; };
+    state = await wb.refresh();
+    assert.equal(state.error, "Jira connection lost");
+    assert.equal(laterReads, 0, "no later read can clear the connection failure");
+    assert.ok(state.issues.some(issue => issue.id === "7"));
+});
+
+test("an issue linked while Apply reads Jira stays in the new working set", async () => {
+    const { wb, gateway, store } = fixture();
+    gateway.lookupIssues = async (cloudId, projectId, ids) => ids.map(id => row(id));
+    gateway.issues = async () => ({ issues: [row("1"), row("5")], fetchedAt: "one" });
+    await wb.refresh();
+    const reading = deferred(), releaseRead = deferred(), releaseWrite = deferred();
+    gateway.issues = async () => { reading.resolve(); await releaseRead.promise; return { issues: [row("1")], fetchedAt: "two" }; };
+    const apply = wb.applyScope({ kind: "jql", value: "key = DEMO-1" });
+    await reading.promise;
+    const original = store.update;
+    const link = data => { data.requests.r = { requestId: "r", scope: wb.selectedScope("5"), nodeId: "5", status: "queued", at: new Date().toISOString() }; };
+    store.update = async change => { if (change === link) await releaseWrite.promise; return original(change); };
+    const write = wb.commit(link);
+    releaseRead.resolve();
+    while (!wb.scopeCommit) await new Promise(resolve => setImmediate(resolve));
+    releaseWrite.resolve();
+    await Promise.all([apply, write]);
+    assert.equal(wb.workingScope.value, "key = DEMO-1");
+    assert.ok(wb.issues.some(issue => issue.id === "5" && issue.tracked), "the request committed during staging keeps its issue");
+    assert.ok((await wb.snapshot()).executions.some(execution => execution.nodeId === "5"));
+});
+
 test("linked work lookup failures and its 300-item limit are reported without hiding the scope page", async () => {
     const { wb, gateway, store } = fixture();
     let asked;
@@ -266,20 +327,17 @@ test("linked work lookup failures and its 300-item limit are reported without hi
     assert.ok(state.ancestorWarnings.some(warning => /Linked work lookup failed: lookup outage/.test(warning)));
 });
 
-test("execution evidence reads are bounded to the visible/selected nodes and captured project identity", async () => {
-    const { wb, gateway, store } = fixture();
-    wb.issues = Array.from({ length: 150 }, (_, index) => row(String(index + 1)));
+test("execution evidence reads every linked trace of the project's own issues, never context from elsewhere", async () => {
+    const { wb, store } = fixture();
+    wb.issues = [row("1"), row("2", { tracked: true }), row("9", { projectId: "43", contextOnly: true }), row("8", { projectId: "", contextOnly: true })];
     await store.update(data => {
-        for (const issue of wb.issues) data.links[wb.selectedScope(issue.id)] = { sessions: [], prs: [] };
+        for (const id of ["project", "1", "2", "8", "9"]) data.links[wb.selectedScope(id)] = { sessions: [], prs: [] };
     });
     const read = [];
-    await wb.setVisible({ workingSetKey: wb.loadKey(), generation: wb.refreshGeneration, revision: 1, nodeIds: ["2", "3"] });
-    await wb.idle();
-    wb.trace.collectTrace = async ({ scope }) => { read.push(scope); throw new Error("test observation"); };
-    await assert.rejects(wb.refreshExecution(), /test observation/);
-    assert.deepEqual(read.sort(), [wb.selectedScope("2"), wb.selectedScope("3")]);
-    assert.equal(gateway.children instanceof Function, true);
-    await assert.rejects(wb.setVisible({ workingSetKey: "old", nodeIds: ["1"] }), /changed/);
+    wb.trace.collectTrace = async ({ scope }) => { read.push(scope); return {}; };
+    store.update = async () => { throw new Error("collection complete"); };
+    await assert.rejects(wb.refreshExecution(), /collection complete/);
+    assert.deepEqual(read.sort(), ["project", "1", "2"].map(id => wb.selectedScope(id)).sort());
 });
 
 test("failed scope reads preserve the applied definition, pages and persisted preferences", async () => {
@@ -321,26 +379,33 @@ test("scope commit completion is a disk/memory boundary before a failing success
     assert.equal((await store.read()).preferences[wb.selectedScope()].workingScope.value, "111");
 });
 
-test("concurrent page outcomes preserve each target's errors independently of banner timing", async () => {
+test("a page installed before a later refresh still reports that it loaded", async () => {
     const { wb, gateway } = fixture();
     await wb.refresh();
-    const child = deferred();
-    gateway.children = () => child.promise;
-    const cacheEntered = deferred(), cacheRelease = deferred();
-    wb.cache = { update: async () => { cacheEntered.resolve(); await cacheRelease.promise; } };
-    gateway.issues = async () => ({ issues: [row("2")], fetchedAt: "next" });
+    const saving = deferred(), release = deferred();
+    wb.cache = { update: async () => { saving.resolve(); await release.promise; } };
+    gateway.issues = async (site, project, options) => options.cursor
+        ? { issues: [row("2")], nextPageToken: null, fetchedAt: "two" }
+        : (() => { throw new Error("Refresh outage"); })();
     const more = wb.loadMore();
-    await cacheEntered.promise;
-    const children = wb.loadChildren({ nodeId: "1" });
-    child.resolve(Promise.reject(new Error("child outage")));
-    const failed = await children;
-    cacheRelease.resolve();
-    const success = await more;
-    assert.equal(failed.pageResult.status, "failed");
-    assert.match(failed.pageResult.error, /child outage/);
-    assert.equal(success.pageResult.status, "loaded");
-    assert.equal(success.pageResult.error, null);
-    assert.match(success.pageError, /child outage/, "success does not erase another target's error");
+    await saving.promise;
+    const refresh = wb.refresh();
+    release.resolve();
+    const [page] = await Promise.all([more, refresh]);
+    assert.equal(page.pageResult.status, "loaded");
+    assert.ok(page.issues.some(issue => issue.id === "2"), "the failed refresh kept the appended page");
+});
+
+test("a failed Apply keeps its error after a later page loads", async () => {
+    const { wb, gateway } = fixture();
+    await wb.refresh();
+    const read = gateway.issues;
+    gateway.issues = async () => { throw new Error("Invalid Jira field"); };
+    await wb.applyScope({ kind: "jql", value: "badField = yes" });
+    gateway.issues = async (...args) => args[2].cursor ? { issues: [row("2")], nextPageToken: null } : read(...args);
+    const page = await wb.loadMore();
+    assert.equal(page.pageResult.status, "loaded");
+    assert.match(page.pageError, /Scope was not applied.*Invalid Jira field/);
 });
 
 test("id-only ancestry is consistent in descendant enumeration, counts and brief parent sources", async () => {
@@ -357,71 +422,13 @@ test("id-only ancestry is consistent in descendant enumeration, counts and brief
 test("foreign context cannot read, write or navigate traces under the selected project", async () => {
     const { wb } = fixture();
     await wb.refresh();
-    await assert.rejects(wb.linkSession({ nodeId: "10", sessionId: "session" }), /own Jira project/);
-    await assert.rejects(wb.refreshTrace("10"), /own Jira project/);
-    await assert.rejects(wb.openSession({ nodeId: "10", sessionId: "session" }), /own Jira project/);
-    await assert.rejects(wb.openPr({ nodeId: "10", repo: "example/demo", number: 1 }), /own Jira project/);
-});
-
-test("visibility reports reject old generations and revisions and refresh newly visible GitHub evidence", async () => {
-    const { wb } = fixture();
-    await wb.refresh();
-    const refreshed = [];
-    wb.trace.refreshExecution = async input => { refreshed.push(input); };
-    const report = (nodeIds, revision, generation = wb.refreshGeneration) => wb.setVisible({ workingSetKey: wb.loadKey(), generation, revision, nodeIds });
-    await report(["1"], 2);
-    await wb.idle();
-    assert.deepEqual(refreshed, [{ source: "all", nodeIds: ["1"] }]);
-    await assert.rejects(report(["10"], 1), /revision changed/);
-    assert.deepEqual([...wb.evidenceNodes], ["1"]);
-    const old = wb.refreshGeneration;
-    await wb.applyScope(DEFAULT_SCOPE);
-    await assert.rejects(report(["10"], 3, old), /changed/);
-    await report(["1"], 4);
-    await wb.idle();
-    assert.equal(refreshed.length, 2, "same-scope reapply refreshes visibility again");
-    await report(["1"], 5);
-    await wb.idle();
-    assert.equal(refreshed.length, 2, "unchanged visible IDs do not repeat GitHub reads");
-});
-
-test("a linked project trace reserves capacity and rotates overflow within the 100-trace bound", async () => {
-    const { wb, store } = fixture();
-    wb.issues = Array.from({ length: 110 }, (_, index) => row(String(index + 1)));
-    wb.evidenceNodes = new Set(wb.issues.slice(0, 100).map(issue => issue.id));
-    await store.update(data => {
-        for (const id of ["project", ...wb.evidenceNodes]) data.links[wb.selectedScope(id)] = { sessions: [], prs: [] };
-    });
-    const read = [];
-    wb.trace.collectTrace = async ({ scope, previous }) => {
-        read.push(scope);
-        return { scope, previous, next: { ...previous, errors: [] } };
-    };
-    // Fail storage after collection: this test is concerned with target selection, not trace merging.
-    store.update = async () => { throw new Error("collection complete"); };
-    await assert.rejects(wb.refreshExecution(), /collection complete/);
-    assert.equal(read.length, 100);
-    assert.ok(read.includes(wb.selectedScope()));
-    assert.ok(!read.includes(wb.selectedScope("100")));
-    read.length = 0;
-    await assert.rejects(wb.refreshExecution(), /collection complete/);
-    assert.equal(read.length, 100);
-    assert.ok(read.includes(wb.selectedScope("100")), "overflow is covered on the next poll");
-});
-
-test("all 100 explicit visible targets are honored without adding an unrelated project trace", async () => {
-    const { wb, store } = fixture();
-    wb.issues = Array.from({ length: 100 }, (_, index) => row(String(index + 1)));
-    await store.update(data => {
-        for (const id of ["project", ...wb.issues.map(issue => issue.id)]) data.links[wb.selectedScope(id)] = { sessions: [], prs: [] };
-    });
-    const read = [];
-    wb.trace.collectTrace = async ({ scope }) => { read.push(scope); return {}; };
-    store.update = async () => { throw new Error("collection complete"); };
-    await assert.rejects(wb.refreshExecution({ nodeIds: wb.issues.map(issue => issue.id) }), /collection complete/);
-    assert.equal(read.length, 100);
-    assert.ok(read.includes(wb.selectedScope("100")));
-    assert.ok(!read.includes(wb.selectedScope()));
+    wb.issues.push(row("11", { projectId: "", contextOnly: true }));
+    for (const nodeId of ["10", "11"]) {
+        await assert.rejects(wb.linkSession({ nodeId, sessionId: "session" }), /own Jira project/);
+        await assert.rejects(wb.refreshTrace(nodeId), /own Jira project/);
+        await assert.rejects(wb.openSession({ nodeId, sessionId: "session" }), /own Jira project/);
+        await assert.rejects(wb.openPr({ nodeId, repo: "example/demo", number: 1 }), /own Jira project/);
+    }
 });
 
 test("an older pick delayed in cache cannot refresh a new project before its scope is restored", async () => {

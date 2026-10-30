@@ -2,7 +2,7 @@ import { scopeKey, descendants, progressRollup, freshnessTone, jiraFreshness } f
 import {
     humanize, sourceFreshness, freshnessSummary, sessionState, sessionsBadge, launchState, launchBlocks, launchLabel, requestOutcome,
     receiptMessage, launchUpdate, primaryReason, executionEvidence, matches, filterTree, descendantSessionCounts, defaultMode,
-    signInNeeded, standaloneHost, banner, statusFilterGroups, sprintOptions, appliedSprint, smartCommitOption, workingSetSummary, childLoadState,
+    signInNeeded, standaloneHost, banner, statusFilterGroups, sprintOptions, appliedSprint, smartCommitOption, workingSetSummary, scopeLabel,
 } from "/view-model.mjs";
 
 const $ = id => document.getElementById(id);
@@ -29,43 +29,6 @@ const initialPreferenceEdits = new Set();
 const disclosures = new Map(), linkDrafts = new Map(), submittedPreviews = new Set();
 const connectionMessages = new Map();
 const executionRefreshes = new Map();
-let visibleTimer, visibleSignature = "", visibleRevision = 0, visiblePending = null;
-const visibleIds = new Set();
-const visibleObserver = new IntersectionObserver(entries => {
-    for (const entry of entries) {
-        const id = entry.target.dataset.nodeId;
-        if (entry.isIntersecting) visibleIds.add(id); else visibleIds.delete(id);
-    }
-    queueVisibleItems();
-}, { root: $("work-scroll") });
-
-function queueVisibleItems() {
-    clearTimeout(visibleTimer);
-    const key = state.workingSetKey, epoch = scopeEpoch, generation = state.workingSetGeneration;
-    if (!key || selecting) return;
-    visibleTimer = setTimeout(async () => {
-        const nodeIds = [...new Set([ui.selected, ...visibleIds].filter(Boolean))].slice(0, 100);
-        const signature = JSON.stringify([key, generation, epoch, nodeIds]);
-        if (signature === (visiblePending?.signature || visibleSignature) || epoch !== scopeEpoch) return;
-        const request = { signature, revision: ++visibleRevision };
-        visiblePending = request;
-        try {
-            const { revision } = request;
-            await api("visible", { workingSetKey: key, generation, revision, nodeIds });
-            if (epoch === scopeEpoch && generation === state.workingSetGeneration && revision === visibleRevision) {
-                visibleSignature = signature; connectionMessage("visible", "");
-            }
-        } catch (error) {
-            if (epoch === scopeEpoch && generation === state.workingSetGeneration && request === visiblePending) {
-                visibleSignature = "";
-                connectionMessage("visible", `Visible-item evidence selection could not be saved: ${error.message}`);
-            }
-        } finally {
-            if (request === visiblePending) visiblePending = null;
-        }
-    }, 100);
-}
-
 function el(tag, text, className) {
     const element = document.createElement(tag);
     if (text !== undefined && text !== null) element.textContent = String(text);
@@ -104,7 +67,8 @@ function nodeLinks(id) {
     const trace = state.site && state.project ? state.links[scopeKey(state.site.id, state.project.id, id)] : null;
     return { sessions: [], prs: [], ...trace };
 }
-const foreignContext = item => Boolean(item?.projectId && item.projectId !== state.project?.id);
+// Traces belong to the selected project's own issues; anything else (including unknown project) is foreign context.
+const foreignContext = item => Boolean(item && item.id !== "project" && item.projectId !== state.project?.id);
 function setSource(element, text, tone, detail) {
     element.textContent = text;
     element.dataset.tone = tone;
@@ -138,13 +102,13 @@ async function api(path, input, signal) {
     }
     return result;
 }
-async function loadPageAction(path, input, context) {
-    const generation = state.workingSetGeneration;
+async function loadMoreAction(context) {
     const version = ++snapshotVersion;
-    const snapshot = await api(path, input);
-    if (!context.current() || generation !== state.workingSetGeneration
-        || snapshot.workingSetGeneration !== generation || snapshot.pageResult?.status === "superseded") return { status: "superseded" };
+    const snapshot = await api("load-more", {});
+    if (!context.current()) return { status: "superseded" };
     if (version === snapshotVersion) acceptSnapshot(snapshot);
+    // The server reports what this request did, even if a later refresh has since replaced the working set.
+    if (snapshot.pageResult?.status === "superseded") return { status: "superseded" };
     if (snapshot.pageResult?.error) throw new Error(snapshot.pageResult.error);
     return snapshot;
 }
@@ -284,8 +248,6 @@ function acceptSnapshot(snapshot, { allowScopeChange = false } = {}) {
     if (preview && state.mapping?.id !== snapshot.mapping?.id) markPreviewDirty();
     state = { ...snapshot, executions: snapshot.executions || [], navigationReceipts: snapshot.navigationReceipts || [] };
     itemsById = new Map(state.issues.map(issue => [issue.id, issue]));
-    visibleRevision = Math.max(visibleRevision, snapshot.visibilityRevision || 0);
-    queueVisibleItems();
     reconcileReceipts();
     render({ force: changedScope });
     updateLaunchControls();
@@ -329,8 +291,7 @@ async function perform({ kind, target, nodeId, label, work, success, refresh = f
     if ((selecting || !scopeConfirmed || standaloneHost(state)) && !global) return;
     if (kind === "prepare" && nodePending(nodeId)) return;
     const record = { kind, scope, nodeId, previewId, status: "pending", message: `${label}...`, dismissed: false };
-    const paging = ["children", "load-more"].includes(kind);
-    const restorePagingFocus = paging && document.activeElement?.dataset.actionKey === key;
+    const restorePagingFocus = kind === "load-more" && document.activeElement?.dataset.actionKey === key;
     actions.set(key, record);
     paintFeedback();
     try {
@@ -484,7 +445,6 @@ function chooseItem(id) {
     tab = "trace";
     savePreferences("selected", "detailsOpen");
     render({ force: true });
-    queueVisibleItems();
     if (matchMedia("(max-width: 1000px)").matches) $("back-to-work").focus({ preventScroll: true });
 }
 function render({ force = false } = {}) {
@@ -495,11 +455,12 @@ function render({ force = false } = {}) {
     selectOptions($("repository"), state.appProjects.map(p => ({ value: p.id, label: p.repo || p.name })), state.mapping?.id, "Choose a Copilot repository");
     renderStatusFilter();
     renderSprintFilter();
-    const scopeSignature = JSON.stringify([state.scope, state.scopeDraft]);
+    // Replace the inputs only when the applied scope or project changes, so an unapplied or rejected edit stays put.
+    const scopeSignature = JSON.stringify([state.scope, state.workingScope]);
     if ($("scope-kind").dataset.signature !== scopeSignature) {
         $("scope-kind").dataset.signature = scopeSignature;
-        $("scope-kind").value = state.scopeDraft?.kind || "project";
-        $("scope-value").value = state.scopeDraft?.value || "";
+        $("scope-kind").value = state.workingScope?.kind || "project";
+        $("scope-value").value = state.workingScope?.value || "";
     }
     $("scope-value").disabled = $("scope-kind").value === "project" || selecting || !state.project;
     $("scope-kind").disabled = $("apply-scope").disabled = selecting || !state.project;
@@ -507,7 +468,7 @@ function render({ force = false } = {}) {
     const scopeSummary = state.project ? workingSetSummary(state) : "Choose a project to load a working set.";
     if ($("scope-summary").textContent !== scopeSummary) $("scope-summary").textContent = scopeSummary;
     $("load-more").hidden = !state.page?.nextPageToken;
-    configureActionControl($("load-more"), "load-more", "working-set", selecting || !state.project);
+    configureActionControl($("load-more"), "load-more", loadMoreTarget(), selecting || !state.project);
     configureActionControl($("project-start"), "prepare", "project", !state.project || !state.mapping || state.cached);
     configureActionControl($("sync-jira"), "launch", "project", selecting || !state.project || !state.mapping || Boolean(state.error) || state.cached || nodePending("project"));
     configureActionControl($("refresh"), "refresh-jira", "jira", selecting || !state.project);
@@ -630,7 +591,7 @@ function renderExecutionFilters() {
     restoreFocus($("execution-filters"), focus);
 }
 function primaryAction(item) {
-    if (item.contextOnly) return badge(item.missing ? "Unavailable parent" : item.expandedChild ? "Additional child context" : "Context-only ancestor");
+    if (item.contextOnly) return badge(item.missing ? "Unavailable parent" : "Context-only ancestor");
     const primary = executionFor(item.id).primary || { kind: "inspect", label: "Inspect work" };
     const label = primary.label || "Inspect work";
     if (primary.kind === "prepare") {
@@ -720,12 +681,10 @@ function refreshSourceButton(label, source = "all", nodeId) {
 }
 function renderTree(force = false) {
     const container = $("tree");
-    const signature = JSON.stringify([ui.view, ui.executionFilter, ui.query, ui.category, sprintFilter(), ui.selected, [...collapsed], state.issues, state.tree, state.executions, state.links, state.requests, state.mapping, state.childPages, state.loadingPages, selecting, scopeConfirmed]);
+    const signature = JSON.stringify([ui.view, ui.executionFilter, ui.query, ui.category, sprintFilter(), ui.selected, [...collapsed], state.issues, state.tree, state.executions, state.links, state.requests, state.mapping, selecting, scopeConfirmed]);
     if (!force && (container.contains(document.activeElement) || signature === treeDigest)) return;
     const focus = captureFocus(container);
     treeDigest = signature;
-    visibleObserver.disconnect();
-    visibleIds.clear();
     container.replaceChildren();
     container.setAttribute("role", ui.view === "hierarchy" ? "tree" : "list");
     container.setAttribute("aria-label", ui.view === "hierarchy" ? "Jira work hierarchy" : "Daily execution queue");
@@ -788,15 +747,6 @@ function renderTree(force = false) {
                 name.append(toggle);
             } else name.append(el("span", "", "toggle-placeholder"));
             name.append(itemName(item, node));
-            const childLabel = childLoadState(item, state.childPages?.[item.id]);
-            if (childLabel) {
-                const childPage = state.childPages?.[item.id];
-                name.append(actionButton(childLabel, "children", item.id, item.id,
-                    context => loadPageAction("children", { nodeId: item.id }, context), {
-                        className: "child-load", disabled: Boolean(childPage && !childPage.nextPageToken),
-                        refresh: true, success: "Child page loaded as context only.",
-                    }));
-            }
             const status = el("div");
             status.append(badge(item.status, item.category));
             const progress = el("div", null, "progress-cell");
@@ -819,8 +769,6 @@ function renderTree(force = false) {
     if (!rows.some(row => row.dataset.nodeId === focusedNode)) focusedNode = rows.find(row => row.dataset.nodeId === ui.selected)?.dataset.nodeId || rows[0]?.dataset.nodeId;
     rows.forEach(row => { row.tabIndex = row.dataset.nodeId === focusedNode ? 0 : -1; });
     $("work-count").textContent = `${rows.length} visible loaded item${rows.length === 1 ? "" : "s"}`;
-    rows.forEach(row => visibleObserver.observe(row));
-    queueVisibleItems();
     $("work-scroll").scrollTop = ui.scrollTop;
     restoreFocus(container, focus);
 }
@@ -829,8 +777,7 @@ function itemName(item, node, compact = false) {
     const meta = el("div", null, "item-keyline");
     meta.append(el("span", (item.type || "Work").slice(0, 1), `type-icon ${item.level > 0 ? "epic" : item.level < 0 ? "subtask" : "story"}`), el("span", item.key, "issue-key"));
     if (item.level > 0 || item.id === "project") meta.append(el("small", item.id === "project" ? "Project scope" : item.type, "muted"));
-    if (item.contextOnly) meta.append(badge(item.missing ? "Missing / restricted" : "Context only"));
-    else if (item.tracked) meta.append(badge("Linked, outside scope"));
+    if (scopeLabel(item)) meta.append(badge(scopeLabel(item)));
     const summary = el("span", item.summary, "summary");
     if (compact) {
         const line = el("div", null, "execution-title");
@@ -873,7 +820,7 @@ function createRow(item, depth, parentId = "", hasChildren = false) {
         row.setAttribute("aria-level", String(depth + 1));
         row.setAttribute("aria-selected", String(ui.selected === item.id));
     } else if (ui.selected === item.id) row.setAttribute("aria-current", "true");
-    row.setAttribute("aria-label", `${item.key} ${item.summary}, Jira ${item.status}`);
+    row.setAttribute("aria-label", `${item.key} ${item.summary}, Jira ${item.status}${scopeLabel(item) ? `, ${scopeLabel(item)}` : ""}`);
     row.addEventListener("click", () => chooseItem(item.id));
     row.addEventListener("focus", () => {
         focusedNode = item.id;
@@ -1369,13 +1316,15 @@ $("apply-scope").addEventListener("click", async () => {
             selecting = false;
             // A view change made just before Apply could not be saved while it ran.
             savePreferences();
-            render({ force: true }); queueVisibleItems();
+            render({ force: true });
             if (restoreFocus && document.activeElement === document.body) $("apply-scope").focus({ preventScroll: true });
         }
     }
 });
+// Keyed by working-set generation: a Load more still pending for a replaced scope must not disable the new one.
+function loadMoreTarget() { return `working-set:${state.workingSetGeneration ?? 0}`; }
 $("load-more").addEventListener("click", () => void perform({
-    kind: "load-more", target: "working-set", label: "Load more", work: context => loadPageAction("load-more", {}, context), refresh: true,
+    kind: "load-more", target: loadMoreTarget(), label: "Load more", work: loadMoreAction, refresh: true,
     success: "Working-set page loaded.",
 }));
 $("search").addEventListener("input", () => { ui.query = $("search").value; savePreferences("query"); renderExecutionFilters(); renderTree(true); paintFeedback(); });

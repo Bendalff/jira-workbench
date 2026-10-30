@@ -392,20 +392,13 @@ export class Gateway {
             fetchedAt: new Date().toISOString(),
         };
     }
-    async children(cloudId, parent, options = {}) {
-        if (!/^\d+$/.test(parent.id)) throw invalid("A numeric parent issue ID is required.");
-        const page = await this.issuePage(cloudId, `parent = ${parent.id} ORDER BY key ASC`, { ...options, sprintField: this.sprintFields.get(cloudId) });
-        if (page.issues.some(issue => issue.parentId !== parent.id && issue.parentKey !== parent.key))
-            throw invalid("Jira child lookup returned an issue outside the requested parent.");
-        return page;
-    }
     async lookupIssues(cloudId, projectId, ids, options = {}) {
         if (!/^\d+$/.test(projectId) || ids.length > 300 || ids.some(id => !/^\d+$/.test(id)))
             throw invalid("Issue identity lookup requires a numeric project and at most 300 numeric issue IDs.");
         const issues = [];
         for (let offset = 0; offset < ids.length; offset += 50) {
             const batch = ids.slice(offset, offset + 50);
-            for await (const page of this.referencePages(cloudId, `project = ${projectId} AND id in (${batch.join(",")})`, batch, options)) {
+            for await (const page of this.referencePages(cloudId, `project = ${projectId} AND id in (${batch.join(",")})`, batch, { ...options, sprintField: this.sprintFields.get(cloudId) })) {
                 if (page.issues.some(issue => issue.projectId !== projectId))
                     throw invalid("Jira issue identity lookup returned unrelated project results.");
                 issues.push(...page.issues);

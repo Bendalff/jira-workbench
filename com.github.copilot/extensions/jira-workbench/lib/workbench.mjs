@@ -5,6 +5,19 @@ import { objects, settle, standaloneError } from "./runtime.mjs";
 import { Trace } from "./trace.mjs";
 import { DEFAULT_SCOPE, mergeIssues, validateScope, workingSetKey, scopeJql } from "./scope.mjs";
 
+// Issues the execution queue must never lose: unresolved launch requests and durable session or PR links.
+function trackedIds(data, prefix) {
+    const ids = new Set();
+    for (const request of Object.values(data.requests))
+        if (request.scope?.startsWith(prefix) && /^\d+$/.test(request.nodeId) && ["queued", "expired", "failed"].includes(requestStatus(request)))
+            ids.add(request.nodeId);
+    for (const [key, link] of Object.entries(data.links)) {
+        const id = key.startsWith(prefix) ? key.slice(prefix.length) : "";
+        if (/^\d+$/.test(id) && (link.sessions?.length || link.prs?.length)) ids.add(id);
+    }
+    return ids;
+}
+
 export class Workbench {
     constructor(options) {
         Object.assign(this, options);
@@ -14,17 +27,17 @@ export class Workbench {
         this.previews = new Map();
         this.issues = [];
         this.workingScope = { ...DEFAULT_SCOPE };
-        this.scopeDraft = { ...DEFAULT_SCOPE };
         this.page = { nextPageToken: null, total: null, loaded: 0 };
-        this.childPages = {};
         this.pageLoads = new Map();
         this.ancestorWarnings = [];
-        this.pageError = null;
+        this.linkedWarnings = [];
         this.pageErrors = {};
         this.attemptedParents = [];
-        this.visibilityRevision = 0;
         this.refreshGeneration = 0;
-        this.evidenceNodes = null;
+        // Store writes that can make an issue tracked (launch requests, session links), so installing a working
+        // set can wait for them instead of dropping an issue whose request landed while Jira was being read.
+        this.commits = 0;
+        this.committing = new Set();
         // The selected project's workflow statuses as Jira listed them; empty when it could not.
         this.statuses = [];
         this.error = null;
@@ -55,13 +68,10 @@ export class Workbench {
         this.jiraRefreshing = null;
         this.issues = [];
         this.page = { nextPageToken: null, total: null, loaded: 0 };
-        this.childPages = {};
         this.ancestorWarnings = [];
-        this.pageError = null;
+        this.linkedWarnings = [];
         this.pageErrors = {};
         this.attemptedParents = [];
-        this.evidenceNodes = null;
-        this.visibilityRevision = 0;
         this.previews.clear();
         this.fetchedAt = null;
         this.error = null;
@@ -71,7 +81,23 @@ export class Workbench {
         const scope = this.selectedScope(), generation = this.refreshGeneration, data = await this.store.read();
         if (scope !== this.currentScope() || generation !== this.refreshGeneration) return;
         this.workingScope = validateScope(data.preferences?.[scope]?.workingScope || DEFAULT_SCOPE);
-        this.scopeDraft = { ...this.workingScope };
+    }
+    commit(change) {
+        this.commits++;
+        const write = this.store.update(change);
+        this.committing.add(write);
+        const done = () => this.committing.delete(write);
+        write.then(done, done);
+        return write;
+    }
+    // The store once no tracked write is pending or started during the read; callers install synchronously after.
+    async committedState() {
+        for (;;) {
+            const count = this.commits;
+            await Promise.allSettled([...this.committing]);
+            const data = await this.store.read();
+            if (count === this.commits && !this.committing.size) return data;
+        }
     }
     remember(change) {
         return this.cache ? this.cache.update(change).catch(() => {}) : Promise.resolve();
@@ -141,8 +167,8 @@ export class Workbench {
         const cached = data.issues?.[this.loadKey()] || (legacy ? { ...legacy, issues: legacy.issues?.slice(0, 100), page: { nextPageToken: null, total: null, loaded: Math.min(legacy.issues?.length || 0, 100) } } : null);
         this.issues = Array.isArray(cached?.issues) ? cached.issues : [];
         this.page = cached?.page || { nextPageToken: null, total: null, loaded: 0 };
-        this.childPages = cached?.childPages || {};
         this.ancestorWarnings = cached?.ancestorWarnings || [];
+        this.linkedWarnings = cached?.linkedWarnings || [];
         this.statuses = Array.isArray(cached?.statuses) ? cached.statuses : [];
         this.fetchedAt = cached?.fetchedAt || null;
         this.cached = true;
@@ -259,7 +285,6 @@ export class Workbench {
             this.site = site;
             this.project = project;
             this.workingScope = { ...DEFAULT_SCOPE };
-            this.scopeDraft = { ...DEFAULT_SCOPE };
             this.resetWorkingSet();
             return true;
         });
@@ -290,7 +315,7 @@ export class Workbench {
     }
     traceNode(nodeId) {
         const node = this.node(nodeId);
-        if (node.projectId && node.projectId !== this.project.id)
+        if (nodeId !== "project" && node.projectId !== this.project.id)
             throw new Error("Select this context item's own Jira project to link or refresh its trace.");
         return node;
     }
@@ -326,13 +351,12 @@ export class Workbench {
             signIn: connection?.state === "signin" ? { server: connection.server, connector: connection.connector } : null,
             projects: this.site ? this.projectLists.get(this.site.id) || [] : [],
             issues: this.issues, tree: buildTree(this.issues),
-            workingScope: this.workingScope, scopeDraft: this.scopeDraft, workingSetKey: this.site && this.project ? this.loadKey() : null,
-            page: this.page, childPages: this.childPages, pageError: Object.values(this.pageErrors).join("\n") || null,
+            workingScope: this.workingScope, workingSetKey: this.site && this.project ? this.loadKey() : null,
+            page: this.page, pageError: Object.values(this.pageErrors).join("\n") || null,
             scopeError: this.pageErrors.scope || null,
             jiraRefreshing: Boolean(this.jiraRefreshing),
             workingSetGeneration: this.refreshGeneration,
-            visibilityRevision: this.visibilityRevision,
-            ancestorWarnings: this.ancestorWarnings, loadingPages: [...this.pageLoads.keys()],
+            ancestorWarnings: [...this.linkedWarnings, ...this.ancestorWarnings],
             statuses: this.site && this.project ? projectStatuses(this.statuses, this.issues.filter(issue => issue.projectId === this.project.id)) : [],
             mapping, links, requests, executions,
             preferences: this.site && this.project ? data.preferences?.[this.selectedScope()] || {} : {},
@@ -342,19 +366,12 @@ export class Workbench {
             refreshing: this.pending.size > 0 || this.executionRefreshes.size > 0,
         };
     }
-    setScope(input) {
-        this.selectedScope();
-        this.scopeDraft = validateScope(input);
-        return this.snapshot();
-    }
-    async applyScope(input = this.scopeDraft) {
+    async applyScope(input) {
         const definition = validateScope(input), scope = this.selectedScope();
         scopeJql(this.project.id, definition);
         const cloudId = this.site.id, projectId = this.project.id;
         const generation = await this.afterScopeCommit(() => {
             if (scope !== this.currentScope()) return null;
-            this.visibilityRevision = 0;
-            this.evidenceNodes = null;
             return this.jiraRefreshing = ++this.refreshGeneration;
         });
         if (generation === null) return { ...await this.snapshot(), applyResult: { status: "superseded" } };
@@ -371,9 +388,10 @@ export class Workbench {
                     data.preferences ||= {};
                     data.preferences[scope] = { ...data.preferences[scope], workingScope: definition };
                 });
+                // The scope is already on disk: an unreadable store must not leave memory on the old scope.
+                const data = await this.committedState().catch(() => null);
                 this.workingScope = definition;
-                this.scopeDraft = { ...definition };
-                this.installWorkingSet(result);
+                this.installWorkingSet(this.keepTracked(result, data));
             } finally {
                 this.scopeCommit = null;
                 release();
@@ -390,7 +408,7 @@ export class Workbench {
         const key = this.loadKey(), cloudId = this.site.id, jiraProjectId = this.project.id;
         const entry = {
             issues: this.issues, statuses: this.statuses, fetchedAt: this.fetchedAt,
-            page: this.page, childPages: this.childPages, ancestorWarnings: this.ancestorWarnings,
+            page: this.page, ancestorWarnings: this.ancestorWarnings, linkedWarnings: this.linkedWarnings,
         };
         await this.remember(data => {
             data.issues[key] = entry;
@@ -408,45 +426,51 @@ export class Workbench {
     async readWorkingSet(cloudId, projectId, definition, fresh) {
         const read = await this.jira(options => this.gateway.issues(cloudId, projectId, { ...options, scope: definition }), fresh);
         const tracked = await this.trackedWork(cloudId, projectId, read.issues, fresh);
-        const context = await this.withAncestors(cloudId, mergeIssues(tracked.issues, read.issues), [], { fresh });
+        const seeds = mergeIssues(tracked.issues, read.issues);
+        // After a connection failure, skip further reads: one succeeding would clear the failure it should report.
+        const context = tracked.connectionError ? { issues: seeds, warnings: [], attemptedParents: [], connectionError: tracked.connectionError }
+            : await this.withAncestors(cloudId, seeds, [], { fresh });
         const statuses = !context.connectionError && this.gateway.statuses
             ? await this.jira(options => this.gateway.statuses(cloudId, projectId, options), fresh).catch(() => null) : null;
-        return { ...read, ...context, warnings: [...tracked.warnings, ...context.warnings], loaded: read.issues.length, statuses };
+        return { ...read, ...context, linkedWarnings: tracked.warnings, checked: tracked.checked, loaded: read.issues.length, statuses };
     }
     // Issues with linked sessions or PRs, or an unresolved launch request, stay in the execution queue whatever
     // scope or page is loaded: a pending request must never vanish because its issue is off the current page.
     async trackedWork(cloudId, projectId, loaded, fresh) {
-        if (!this.gateway.lookupIssues) return { issues: [], warnings: [] };
-        const data = await this.store.read();
-        const prefix = `${[cloudId, projectId].map(encodeURIComponent).join("/")}/`;
-        const ids = new Set();
-        for (const request of Object.values(data.requests))
-            if (request.scope?.startsWith(prefix) && /^\d+$/.test(request.nodeId) && ["queued", "expired", "failed"].includes(requestStatus(request)))
-                ids.add(request.nodeId);
-        for (const [key, link] of Object.entries(data.links)) {
-            const id = key.startsWith(prefix) ? key.slice(prefix.length) : "";
-            if (/^\d+$/.test(id) && (link.sessions?.length || link.prs?.length)) ids.add(id);
-        }
+        const none = { issues: [], warnings: [], checked: new Set() };
+        if (!this.gateway.lookupIssues) return none;
         const have = new Set(loaded.map(issue => issue.id));
-        const missing = [...ids].filter(id => !have.has(id)), wanted = missing.slice(0, 300);
-        if (!wanted.length) return { issues: [], warnings: [] };
+        const missing = [...trackedIds(await this.store.read(), `${[cloudId, projectId].map(encodeURIComponent).join("/")}/`)]
+            .filter(id => !have.has(id));
+        const wanted = missing.slice(0, 300);
+        if (!wanted.length) return none;
         const warnings = missing.length > wanted.length ? [`${missing.length - wanted.length} linked items exceed the 300-item limit and are not loaded.`] : [];
         try {
             const issues = await this.jira(options => this.gateway.lookupIssues(cloudId, projectId, wanted, options), fresh);
             const found = new Set(issues.map(issue => issue.id)), unavailable = wanted.filter(id => !found.has(id)).length;
             if (unavailable) warnings.push(`${unavailable} linked items are missing, restricted or moved and are not shown.`);
-            return { issues: issues.map(issue => ({ ...issue, tracked: true })), warnings };
+            return { issues: issues.map(issue => ({ ...issue, tracked: true })), warnings, checked: new Set(wanted) };
         } catch (error) {
-            return { issues: [], warnings: [...warnings, `Linked work lookup failed: ${error.message}`] };
+            return { ...none, warnings: [...warnings, `Linked work lookup failed: ${error.message}. Previously loaded linked items are kept.`],
+                connectionError: error.kind && error.kind !== "permanent" ? error.message : undefined };
         }
+    }
+    // Keep linked items the new read could not confirm (a failed lookup, or a request or link committed while Jira
+    // was being read) from the current working set, rather than drop them until the next refresh.
+    keepTracked(result, data) {
+        if (!data) return result;
+        const ids = trackedIds(data, `${[this.site.id, this.project.id].map(encodeURIComponent).join("/")}/`);
+        const have = new Set(result.issues.map(issue => issue.id));
+        const kept = this.issues.filter(issue => issue.projectId === this.project.id && !issue.contextOnly
+            && ids.has(issue.id) && !have.has(issue.id) && !result.checked?.has(issue.id));
+        return kept.length ? { ...result, issues: mergeIssues(result.issues, kept.map(issue => ({ ...issue, tracked: true }))) } : result;
     }
     installWorkingSet(result) {
         this.issues = result.issues;
         this.page = { nextPageToken: result.nextPageToken || null, total: result.total ?? null, loaded: result.loaded, cursors: [] };
-        this.childPages = {};
         this.ancestorWarnings = result.warnings;
+        this.linkedWarnings = result.linkedWarnings || [];
         this.attemptedParents = result.attemptedParents;
-        this.pageError = null;
         this.pageErrors = {};
         this.previews.clear();
         this.statuses = result.statuses || [];
@@ -481,8 +505,6 @@ export class Workbench {
         const scope = this.loadKey();
         const generation = await this.afterScopeCommit(() => {
             if (!this.currentScope() || scope !== this.loadKey()) return null;
-            this.visibilityRevision = 0;
-            this.evidenceNodes = null;
             return this.jiraRefreshing = ++this.refreshGeneration;
         });
         if (generation === null) return this.snapshot();
@@ -492,7 +514,9 @@ export class Workbench {
             const { id: cloudId } = this.site, { id: projectId } = this.project;
             const result = await this.readWorkingSet(cloudId, projectId, definition, fresh);
             if (!current()) return this.snapshot();
-            this.installWorkingSet(result);
+            const data = await this.committedState();
+            if (!current()) return this.snapshot();
+            this.installWorkingSet(this.keepTracked(result, data));
             await this.saveWorkingSet();
         } catch (error) {
             if (current()) this.error = error.message;
@@ -503,76 +527,48 @@ export class Workbench {
     }
     async loadMore() {
         if (!this.page.nextPageToken) return this.snapshot();
-        return this.loadPage();
-    }
-    async loadChildren({ nodeId }) {
-        const node = this.node(nodeId);
-        if (nodeId === "project") throw new Error("Use Load more for project work.");
-        if (node.level < 0) throw new Error("Subtasks cannot have children.");
-        if (this.childPages[nodeId]?.loaded !== undefined && !this.childPages[nodeId].nextPageToken) return this.snapshot();
-        return this.loadPage(node);
-    }
-    async loadPage(parent = null) {
         if (this.jiraRefreshing) throw new Error("Wait for the first scope page to finish refreshing before loading more.");
-        const key = this.loadKey(), generation = this.refreshGeneration;
-        const target = parent?.id || "working-set", flightKey = `${generation}:${target}`;
-        if (this.pageLoads.has(flightKey)) return this.pageLoads.get(flightKey);
+        const key = this.loadKey(), generation = this.refreshGeneration, target = "working-set";
+        if (this.pageLoads.has(generation)) return this.pageLoads.get(generation);
         const { id: cloudId } = this.site, { id: projectId } = this.project;
-        const definition = this.workingScope, before = parent ? this.childPages[parent.id] : this.page;
-        const existing = this.issues;
-        const attemptedParents = this.attemptedParents;
-        const cursor = before?.nextPageToken || null;
+        const definition = this.workingScope, before = this.page, existing = this.issues, attemptedParents = this.attemptedParents;
+        const cursor = before.nextPageToken;
         const current = () => generation === this.refreshGeneration && this.currentScope() && key === this.loadKey();
         const pending = (async () => {
             let outcome = { target, status: "superseded", error: null };
             try {
-                const read = await this.jira(options => parent ? this.gateway.children(cloudId, parent, { ...options, cursor })
-                    : this.gateway.issues(cloudId, projectId, { ...options, scope: definition, cursor }), true);
-                const seeds = read.issues.map(issue => parent ? { ...issue, contextOnly: true, expandedChild: true } : issue);
-                const result = { ...read, ...await this.withAncestors(cloudId, seeds, existing, { fresh: true }, attemptedParents), loadedIds: read.issues.map(issue => issue.id) };
+                const read = await this.jira(options => this.gateway.issues(cloudId, projectId, { ...options, scope: definition, cursor }), true);
+                // Every loaded item is a seed, so parents whose lookup failed on an earlier page are retried; resolved
+                // and confirmed-missing parents are skipped.
+                const context = await this.withAncestors(cloudId, mergeIssues(existing, read.issues), existing, { fresh: true }, attemptedParents);
                 if (!current()) return { ...await this.snapshot(), pageResult: outcome };
-                if (result.nextPageToken && [cursor, ...(before?.cursors || [])].includes(result.nextPageToken))
+                if (read.nextPageToken && [cursor, ...(before.cursors || [])].includes(read.nextPageToken))
                     throw new Error("Jira pagination repeated a cursor; loaded data was preserved.");
-                this.issues = mergeIssues(this.issues, result.issues);
-                const ids = [...new Set([...(before?.ids || []), ...result.loadedIds])];
-                const page = { nextPageToken: result.nextPageToken || null, total: result.total ?? before?.total ?? null,
-                    loaded: parent ? ids.length : this.issues.filter(issue => !issue.contextOnly && !issue.tracked).length,
-                    ids: parent ? ids : [], cursors: [...(before?.cursors || []), ...(cursor ? [cursor] : [])] };
-                if (parent) this.childPages = { ...this.childPages, [parent.id]: page };
-                else this.page = page;
-                this.ancestorWarnings = [...new Set([...this.ancestorWarnings, ...result.warnings])];
-                if (result.connectionError) this.error = result.connectionError;
+                this.issues = mergeIssues(this.issues, context.issues);
+                this.page = { nextPageToken: read.nextPageToken || null, total: read.total ?? before.total ?? null,
+                    loaded: this.issues.filter(issue => !issue.contextOnly && !issue.tracked).length,
+                    cursors: [...(before.cursors || []), cursor] };
+                // Every unresolved parent was just re-attempted, so these warnings replace the earlier ones.
+                this.ancestorWarnings = context.warnings;
+                if (context.connectionError) this.error = context.connectionError;
                 delete this.pageErrors[target];
-                this.pageError = Object.values(this.pageErrors).join("\n") || null;
-                this.attemptedParents = [...new Set([...this.attemptedParents, ...result.attemptedParents])];
+                this.attemptedParents = [...new Set([...this.attemptedParents, ...context.attemptedParents])];
                 this.previews.clear();
+                // Installed: a refresh that starts while this saves does not make the page any less loaded.
+                outcome = { target, status: "loaded", error: null };
                 await this.saveWorkingSet();
-                if (current()) outcome = { target, status: "loaded", error: null };
             } catch (error) {
                 if (current()) {
-                    const message = `${parent ? `Children of ${parent.key}` : "Load more"}: ${error.message}`;
+                    const message = `Load more: ${error.message}`;
                     this.pageErrors[target] = message;
-                    this.pageError = Object.values(this.pageErrors).join("\n");
                     outcome = { target, status: "failed", error: message };
                 }
             }
             return { ...await this.snapshot(), pageResult: outcome };
         })();
-        this.pageLoads.set(flightKey, pending);
+        this.pageLoads.set(generation, pending);
         try { return await pending; }
-        finally { this.pageLoads.delete(flightKey); }
-    }
-    async setVisible({ nodeIds, workingSetKey: key, generation, revision }) {
-        if (key !== this.loadKey() || generation !== this.refreshGeneration || !Number.isSafeInteger(revision) || revision <= this.visibilityRevision)
-            throw new Error("The working scope or visibility revision changed; visible items were not saved.");
-        if (!Array.isArray(nodeIds) || nodeIds.length > 100 || nodeIds.some(id => typeof id !== "string" || id.length > 100))
-            throw new Error("Provide at most 100 visible issue IDs.");
-        const next = new Set(nodeIds.filter(id => id === "project" || this.issues.some(issue => issue.id === id && (!issue.projectId || issue.projectId === this.project.id))));
-        const newlyVisible = [...next].filter(id => !this.evidenceNodes?.has(id));
-        this.evidenceNodes = next;
-        this.visibilityRevision = revision;
-        if (newlyVisible.length) void this.background(() => this.inSession(() => this.trace.refreshExecution({ source: "all", nodeIds: newlyVisible })));
-        return { status: "saved" };
+        finally { this.pageLoads.delete(generation); }
     }
     // Delegates: F-owned; C must not edit; L may append clearRequest
     prepare(input) { return this.inSession(() => this.launches.prepare(input)); }

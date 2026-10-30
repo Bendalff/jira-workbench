@@ -148,16 +148,11 @@ test("launch rechecks preview membership inside the persistence transaction afte
     assert.deepEqual((await store.read()).requests, {});
 });
 
-test("project sync includes durable unloaded evidence but not foreign workflow statuses", async t => {
-    const { workbench, store, gateway, sent } = await fixture(t);
+test("project sync includes loaded linked work but not foreign workflow statuses", async t => {
+    const { workbench, store, sent } = await fixture(t);
     await workbench.map({ copilotProjectId: copilot.id });
     await workbench.linkSession({ nodeId: "2", sessionId: "session-1" });
-    workbench.issues = [rows[0], { ...rows[1], id: "9", projectId: "43", key: "FOREIGN-9", status: "Foreign workflow", contextOnly: true }];
-    gateway.lookupIssues = async (cloudId, projectId, ids) => {
-        assert.equal(projectId, "42");
-        assert.deepEqual(ids, ["2"]);
-        return [rows[1]];
-    };
+    workbench.issues = [rows[0], { ...rows[1], tracked: true }, { ...rows[1], id: "9", projectId: "43", key: "FOREIGN-9", status: "Foreign workflow", contextOnly: true }];
     const snapshot = await workbench.snapshot();
     assert.ok(!snapshot.statuses.some(status => status.name === "Foreign workflow"));
     await workbench.syncJira();
@@ -169,23 +164,52 @@ test("project sync includes durable unloaded evidence but not foreign workflow s
     assert.equal(Object.keys((await store.read()).links).length, 1);
 });
 
-test("project sync reports unresolved and over-limit durable evidence without claiming completeness", async t => {
-    const { workbench, store, gateway, sent } = await fixture(t);
+test("project sync reports linked issues it could not load without claiming completeness", async t => {
+    const { workbench, store, sent } = await fixture(t);
     await workbench.map({ copilotProjectId: copilot.id });
     await store.update(data => {
         for (let id = 100; id < 405; id++) data.links[workbench.selectedScope(String(id))] = { sessions: [{ name: "Unloaded active work" }], prs: [] };
     });
-    let requested = 0;
-    gateway.lookupIssues = async (cloudId, projectId, ids) => {
-        requested = ids.length;
-        throw new Error("Identity lookup unavailable");
-    };
     await workbench.syncJira();
-    assert.equal(requested, 300);
     const kickoff = JSON.parse(sent[0].prompt.split("\n\n").find(part => part.includes('"kickoff"'))).kickoff.prompt;
-    assert.match(kickoff, /305 linked issue\(s\) were omitted/);
-    assert.match(kickoff, /Identity lookup unavailable/);
+    assert.match(kickoff, /305 linked issue\(s\) were omitted from linkedWork because of the size limit or because the Workbench could not load them/);
     assert.doesNotMatch(kickoff, /No linked issues were omitted/);
+});
+
+test("Update Jira rejects a sync prepared across a switch to another project and back", async t => {
+    const { workbench, store, sent } = await fixture(t);
+    await workbench.map({ copilotProjectId: copilot.id });
+    const read = store.read.bind(store);
+    let switched = false;
+    store.read = async () => {
+        const data = await read();
+        // What a pick of another project and then this one does while the sync reads the store.
+        if (!switched) { switched = true; workbench.selections += 2; workbench.statuses = [{ name: "Other project status", category: "new" }]; }
+        return data;
+    };
+    await assert.rejects(workbench.syncJira(), /Project changed/);
+    assert.equal(sent.length, 0);
+    assert.deepEqual((await store.read()).requests, {});
+});
+
+test("project and parent briefs say when they include only loaded descendants", async t => {
+    const { workbench, sent } = await fixture(t);
+    await workbench.map({ copilotProjectId: copilot.id });
+    const complete = await workbench.prepare({ nodeId: "1", mode: "plan" });
+    assert.ok(!complete.brief.warnings.some(warning => warning.id === "partial-context"), "the whole project is loaded");
+    workbench.page.nextPageToken = "more";
+    const story = await workbench.prepare({ nodeId: "2", mode: "plan" });
+    assert.ok(!story.brief.warnings.some(warning => warning.id === "partial-context"), "a story brief is not flagged");
+    const preview = await workbench.prepare({ nodeId: "project", mode: "plan" });
+    assert.match(preview.brief.warnings.find(warning => warning.id === "partial-context").message,
+        /^Only 2 loaded descendants are included; more scope pages remain in Jira\. Other child work may exist\.$/);
+    await confirm(workbench, preview);
+    const kickoff = JSON.parse(sent[0].prompt.split("\n\n").find(part => part.includes('"kickoff"'))).kickoff.prompt;
+    assert.match(kickoff, /only the items the Workbench had loaded, not the complete set of child work/);
+    workbench.page.nextPageToken = null;
+    workbench.workingScope = { kind: "jql", value: "assignee = currentUser()" };
+    const filtered = await workbench.prepare({ nodeId: "1", mode: "plan" });
+    assert.match(filtered.brief.warnings.find(warning => warning.id === "partial-context").message, /the working scope filters which items load/);
 });
 
 

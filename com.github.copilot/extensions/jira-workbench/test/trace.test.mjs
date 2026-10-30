@@ -58,7 +58,7 @@ test("trace refresh retains earlier PRs when the same session records another PR
     assert.deepEqual((await store.read()).links["cloud-demo/42/2"].prs.map(p => p.number).sort(), [9, 10].sort());
 });
 
-test("newly visible work observes session metadata before discovering a new PR", async t => {
+test("a live refresh observes session metadata before discovering a new PR", async t => {
     const { workbench, gateway, store, githubReads } = await fixture(t);
     await workbench.map({ copilotProjectId: copilot.id });
     const original = gateway.call;
@@ -70,8 +70,7 @@ test("newly visible work observes session metadata before discovering a new PR",
     await workbench.linkSession({ nodeId: "2", sessionId: "session-1" });
     assert.equal((await store.read()).links["cloud-demo/42/2"].sessions[0].prNumber, null);
     hasPr = true;
-    await workbench.setVisible({ nodeIds: ["2"], workingSetKey: workbench.loadKey(), generation: workbench.refreshGeneration, revision: 1 });
-    await workbench.idle();
+    await workbench.refreshExecution();
     assert.deepEqual(githubReads, ["example/demo#9"]);
     assert.equal((await store.read()).links["cloud-demo/42/2"].sourceStatus.github.state, "fresh");
 });
