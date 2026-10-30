@@ -152,7 +152,9 @@ project with a linked session or pull request, or a queued, expired or failed
 launch request, are read by ID on every first-page read (up to 300) and stay in
 **Execution** and **Hierarchy**. They are labeled **Linked, outside scope** and
 are not counted as scope matches. Linked issues that are missing, restricted or
-over the limit are reported in the warning banner.
+over the limit are reported in the warning banner. If that read fails, linked
+items already shown stay, labeled **Linked, not re-read from Jira**; they ask for
+a **Refresh** and cannot start work until a later read confirms them.
 
 **Search loaded items**, status and sprint controls only filter the loaded
 copy. They do not change the server scope or discover unloaded matches.
@@ -183,12 +185,14 @@ When the working scope is not the whole project, or more pages remain, a
 session brief for the project or a parent includes only the loaded
 descendants. The preview warns about this, so **Implement** needs that warning
 acknowledged, and the session's kickoff says the descendant list is incomplete.
+A story's kickoff says the same about its subtasks, without an extra warning
+in the preview.
 
 **Update Jira** remains project-wide, not limited to the loaded scope. It
-includes durable session and PR links for up to 300 linked issues, which are
-always loaded. Linked issues the canvas could not load, or that exceed the
-limit, are reported as omitted evidence for the sync session to verify, not
-as evidence that no work exists.
+includes durable session and PR links for up to 300 linked issues, reading
+from Jira any that are not loaded in the panel. Linked issues it cannot read,
+or that exceed the limit, are reported as omitted evidence for the sync session
+to verify, not as evidence that no work exists.
 
 ---
 

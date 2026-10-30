@@ -88,10 +88,14 @@ Tracked issues are actionable work in the execution queue and hierarchy,
 labeled **Linked, outside scope**, and excluded from scope counts; a later page
 that returns one promotes it to a scope item. Lookup failures, unavailable
 identities and the limit are reported as warnings, never as an empty queue.
-When the lookup fails, linked items already loaded are kept; a classified
-connection failure marks the snapshot stale and skips the remaining reads so
-none can clear it. Requests and links committed while a first page is being
-read are reconciled before it is installed, so their issues are kept too.
+When the lookup fails, linked items already loaded are kept but marked
+`unverified`: they derive execution as Jira-stale and cannot be prepared until a
+later read confirms them. A classified connection failure also marks the
+snapshot stale and skips the remaining reads so none can clear it. Requests and
+links committed while a first page is being read are reconciled before it is
+installed: their loaded issues are kept (also `unverified`), and a same-project
+parent read as context in that read becomes linked work. The first page probes
+the site's sprint field; continuation pages reuse that answer.
 
 Referenced ancestor keys or IDs are deduplicated and read in batches of 50
 without the working scope's constraints, recursively up to 32 levels.
@@ -114,7 +118,9 @@ execution-queue counts. A later working-set page can promote a matching
 context item to work. All progress and descendant metrics describe loaded
 items, never complete child totals. When the scope is not the whole project or
 more pages remain, project and parent briefs carry a `partial-context` warning
-and the kickoff states that the descendant list is incomplete.
+and the kickoff states that the descendant list is incomplete. Stories get the
+same kickoff statement about their subtasks, without a preview warning that
+would need acknowledging.
 
 Working-set caches include site, project and scope definition. Generation
 guards reject late scope, refresh and page responses, including an A-B-A
@@ -131,9 +137,10 @@ refresh traces using the selected project's mapping. Select its owning
 project to use those controls.
 
 Project-wide **Update Jira** gathers evidence from durable project links,
-independently of loaded scope pages. Linked issues are always loaded, so it
-uses the loaded rows for up to 300 of them and reports the rest as omitted,
-never as absent work. It reads the selected project's issues and statuses
+independently of loaded scope pages. For up to 300 linked issues it uses the
+loaded rows and reads any that are not loaded (or not re-read) in
+project-constrained batches; it reports unreadable and over-limit identities as
+omitted, never as absent work. It reads the selected project's issues and statuses
 before any wait and rejects the sync if the project selection changed in the
 meantime, including a switch away and back. Workflow status choices exclude
 foreign context items.

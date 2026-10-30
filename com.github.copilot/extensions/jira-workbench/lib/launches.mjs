@@ -3,6 +3,9 @@ import { launchPrompt, jiraSyncPrompt, descendants, projectStatuses, requestStat
 import { createBrief, acknowledgeBrief } from "./brief.mjs";
 import { dependencyWarnings } from "./execution.mjs";
 
+// The loaded working set can miss children when the scope filters items or more pages remain.
+const partialScope = wb => ({ filtered: wb.workingScope.kind !== "project", more: Boolean(wb.page.nextPageToken) });
+
 // Launch and request lifecycle: briefs, previews, queued requests and their receipts, failures or clears.
 // Panel state (selection, issues, previews, store, send) stays on the Workbench and is read through it.
 export class Launches {
@@ -10,9 +13,9 @@ export class Launches {
     makeBrief(node, mode, fields, mapping, smartCommitComment = false) {
         const wb = this.workbench;
         const children = descendants(wb.issues, node.id);
-        const filtered = wb.workingScope.kind !== "project", more = Boolean(wb.page.nextPageToken);
+        const { filtered, more } = partialScope(wb);
         // A project or parent brief lists only loaded descendants; say so whenever the working set is not the whole project.
-        const partial = (node.id === "project" || node.level > 0) && (filtered || more) ? [{
+        const partial = node.level > 0 && (filtered || more) ? [{
             id: "partial-context",
             message: `Only ${children.length} loaded descendant${children.length === 1 ? " is" : "s are"} included${more ? "; more scope pages remain in Jira" : ""}${filtered ? "; the working scope filters which items load" : ""}. Other child work may exist.`,
         }] : [];
@@ -27,6 +30,7 @@ export class Launches {
         const scope = wb.selectedScope(nodeId), node = wb.node(nodeId);
         const workingSetKey = wb.loadKey(), scopeGeneration = wb.refreshGeneration;
         if (node.contextOnly) throw new Error("This item is context only. Include it in a project working scope before launching work.");
+        if (node.unverified) throw new Error("Jira did not re-read this linked item. Refresh before starting work from it.");
         if (wb.error) throw new Error("Refresh Jira successfully before starting work from stale data.");
         if (wb.cached) throw new Error("Jira is still refreshing the cached snapshot. Try again when it is current.");
         const data = await wb.store.read(), mapping = data.mappings[wb.selectedScope()];
@@ -93,6 +97,8 @@ export class Launches {
             await wb.send({ prompt: launchPrompt({
                 ...preview, requestId, instanceId: wb.instanceId,
                 copilotProjectId: preview.mapping.id, repo: preview.mapping.repo,
+                // Any issue that can have children, including a story's subtasks; the scope was checked unchanged above.
+                partialChildren: preview.node.level >= 0 && Object.values(partialScope(wb)).some(Boolean),
             }) });
         } catch (error) {
             await this.failRequest({ requestId, message: `Could not queue launch: ${error.message}` });
@@ -111,13 +117,18 @@ export class Launches {
         if (wb.selections !== selection) throw new Error("Project changed while preparing the sync.");
         if (!mapping) throw new Error("Select the Copilot repository for this Jira project before syncing statuses.");
         if (!wb.appProjects.some(p => p.id === mapping.id)) throw new Error("The mapped Copilot project is no longer available; choose another repository.");
-        // Linked issues are always loaded (as scope items or linked work), so loaded rows cover every durable link
-        // except ones over the 300-item limit or no longer readable; those are counted as omitted.
         const prefix = scope.slice(0, scope.lastIndexOf("/") + 1);
         const durable = Object.entries(data.links).filter(([key, link]) => key.startsWith(prefix)
             && /^\d+$/.test(key.slice(prefix.length)) && (link.sessions?.length || link.prs?.length));
-        const byId = new Map(issues.filter(issue => issue.projectId === project.id).map(issue => [issue.id, issue]));
-        const evidence = durable.flatMap(([key, link]) => {
+        const candidates = durable.slice(0, 300);
+        const byId = new Map(issues.filter(issue => issue.projectId === project.id && !issue.unverified).map(issue => [issue.id, issue]));
+        // Linked issues not loaded here (linked by another panel since the last read, or not re-read) are read now.
+        const missing = candidates.map(([key]) => key.slice(prefix.length)).filter(id => !byId.has(id));
+        if (missing.length && wb.gateway.lookupIssues) {
+            try { for (const issue of await wb.jira(options => wb.gateway.lookupIssues(site.id, project.id, missing, options))) byId.set(issue.id, issue); }
+            catch { /* identities that could not be read are reported as omitted below */ }
+        }
+        const evidence = candidates.flatMap(([key, link]) => {
             const issue = byId.get(key.slice(prefix.length));
             if (!issue) return [];
             const freshness = name => link.sourceStatus?.[name]?.state || "unknown";
@@ -127,7 +138,7 @@ export class Launches {
                 sessions: (link.sessions || []).map(s => ({ name: s.name, activity: s.activity, stale: Boolean(s.stale), branch: s.branch, prRepo: s.prRepo, prNumber: s.prNumber })),
                 prs: (link.prs || []).map(pr => ({ repo: pr.repo, number: pr.number, state: pr.state, isDraft: pr.isDraft, stale: Boolean(pr.stale), url: pr.url })),
             }];
-        }).slice(0, 300);
+        });
         const omittedLinkedIssues = durable.length - evidence.length;
         const requestId = randomUUID();
         const prompt = jiraSyncPrompt({

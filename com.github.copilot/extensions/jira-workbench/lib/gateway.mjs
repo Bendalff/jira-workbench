@@ -367,7 +367,8 @@ export class Gateway {
     }
     async issues(cloudId, projectId, options = {}) {
         if (!/^\d+$/.test(projectId)) throw invalid("A numeric Jira project ID is required.");
-        const sprintField = await this.sprintField(cloudId, projectId, options);
+        // The first page discovers the sprint field; continuation pages reuse that answer instead of probing again.
+        const sprintField = options.cursor ? this.sprintFields.get(cloudId) ?? null : await this.sprintField(cloudId, projectId, options);
         const result = await this.issuePage(cloudId, scopeJql(projectId, options.scope || DEFAULT_SCOPE), { ...options, sprintField });
         if (result.issues.some(row => row.projectId !== projectId)) throw invalid("Jira returned an issue outside the selected project.");
         return result;

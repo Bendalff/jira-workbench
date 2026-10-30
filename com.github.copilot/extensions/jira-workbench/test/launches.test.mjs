@@ -176,6 +176,27 @@ test("project sync reports linked issues it could not load without claiming comp
     assert.doesNotMatch(kickoff, /No linked issues were omitted/);
 });
 
+test("project sync reads linked issues that are not loaded before counting them as omitted", async t => {
+    const { workbench, store, gateway, sent } = await fixture(t);
+    await workbench.map({ copilotProjectId: copilot.id });
+    await store.update(data => {
+        data.links[workbench.selectedScope("7")] = { sessions: [{ name: "Linked elsewhere" }], prs: [] };
+        data.links[workbench.selectedScope("8")] = { sessions: [{ name: "Restricted" }], prs: [] };
+    });
+    workbench.issues = [...workbench.issues, { ...rows[1], id: "5", key: "DEMO-5", tracked: true, unverified: true }];
+    await store.update(data => { data.links[workbench.selectedScope("5")] = { sessions: [{ name: "Not re-read" }], prs: [] }; });
+    gateway.lookupIssues = async (cloudId, projectId, ids) => {
+        assert.equal(projectId, "42");
+        assert.deepEqual(ids.sort(), ["5", "7", "8"]);
+        return [{ ...rows[1], id: "5", key: "DEMO-5" }, { ...rows[1], id: "7", key: "DEMO-7" }];
+    };
+    await workbench.syncJira();
+    const kickoff = JSON.parse(sent[0].prompt.split("\n\n").find(part => part.includes('"kickoff"'))).kickoff.prompt;
+    assert.match(kickoff, /"key": "DEMO-7"/);
+    assert.match(kickoff, /"key": "DEMO-5"/);
+    assert.match(kickoff, /1 linked issue\(s\) were omitted/);
+});
+
 test("Update Jira rejects a sync prepared across a switch to another project and back", async t => {
     const { workbench, store, sent } = await fixture(t);
     await workbench.map({ copilotProjectId: copilot.id });
@@ -199,7 +220,12 @@ test("project and parent briefs say when they include only loaded descendants", 
     assert.ok(!complete.brief.warnings.some(warning => warning.id === "partial-context"), "the whole project is loaded");
     workbench.page.nextPageToken = "more";
     const story = await workbench.prepare({ nodeId: "2", mode: "plan" });
-    assert.ok(!story.brief.warnings.some(warning => warning.id === "partial-context"), "a story brief is not flagged");
+    assert.ok(!story.brief.warnings.some(warning => warning.id === "partial-context"), "a story needs no extra acknowledgement");
+    await confirm(workbench, story);
+    const storyKickoff = JSON.parse(sent[0].prompt.split("\n\n").find(part => part.includes('"kickoff"'))).kickoff.prompt;
+    assert.match(storyKickoff, /not the complete set of child work or subtasks/, "its kickoff still says subtasks may be missing");
+    await workbench.recordSession({ requestId: Object.keys((await workbench.store.read()).requests)[0], sessionId: "session-1" });
+    sent.length = 0;
     const preview = await workbench.prepare({ nodeId: "project", mode: "plan" });
     assert.match(preview.brief.warnings.find(warning => warning.id === "partial-context").message,
         /^Only 2 loaded descendants are included; more scope pages remain in Jira\. Other child work may exist\.$/);

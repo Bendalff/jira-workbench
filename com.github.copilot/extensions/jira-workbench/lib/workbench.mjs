@@ -339,7 +339,7 @@ export class Workbench {
             executionNodes.push(this.node("project"));
         const executions = executionNodes.map(issue => deriveExecution({
             issue, trace: links[this.selectedScope(issue.id)] || {}, mapping,
-            requests: requests.filter(r => r.nodeId === issue.id), jiraStale: Boolean(this.error),
+            requests: requests.filter(r => r.nodeId === issue.id), jiraStale: Boolean(this.error || issue.unverified),
         })).sort((a, b) => a.rank - b.rank || a.nodeId.localeCompare(b.nodeId, undefined, { numeric: true }));
         const connection = this.connection?.status();
         return {
@@ -460,10 +460,18 @@ export class Workbench {
     keepTracked(result, data) {
         if (!data) return result;
         const ids = trackedIds(data, `${[this.site.id, this.project.id].map(encodeURIComponent).join("/")}/`);
-        const have = new Set(result.issues.map(issue => issue.id));
-        const kept = this.issues.filter(issue => issue.projectId === this.project.id && !issue.contextOnly
-            && ids.has(issue.id) && !have.has(issue.id) && !result.checked?.has(issue.id));
-        return kept.length ? { ...result, issues: mergeIssues(result.issues, kept.map(issue => ({ ...issue, tracked: true }))) } : result;
+        const own = issue => issue.projectId === this.project.id && ids.has(issue.id);
+        // A same-project parent read as context during this read becomes linked work once it is linked.
+        let issues = result.issues.map(issue => {
+            if (!issue.contextOnly || !own(issue)) return issue;
+            const { contextOnly, ...work } = issue;
+            return { ...work, tracked: true };
+        });
+        const have = new Set(issues.map(issue => issue.id));
+        const kept = this.issues.filter(issue => !issue.contextOnly && own(issue) && !have.has(issue.id) && !result.checked?.has(issue.id));
+        // Not re-read by this Jira read: still shown, but stale and unable to start work until a later read confirms them.
+        if (kept.length) issues = mergeIssues(issues, kept.map(issue => ({ ...issue, tracked: true, unverified: true })));
+        return { ...result, issues };
     }
     installWorkingSet(result) {
         this.issues = result.issues;

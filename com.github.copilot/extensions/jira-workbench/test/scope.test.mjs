@@ -276,8 +276,11 @@ test("a failed linked-work lookup keeps loaded linked items, and a connection fa
     assert.ok(wb.issues.some(issue => issue.id === "7" && issue.tracked));
     gateway.lookupIssues = async () => { throw new Error("lookup outage"); };
     let state = await wb.refresh();
-    assert.ok(state.issues.some(issue => issue.id === "7" && issue.tracked), "kept from the previous working set");
-    assert.ok(state.executions.some(execution => execution.nodeId === "7"));
+    const kept = state.issues.find(issue => issue.id === "7");
+    assert.ok(kept?.tracked && kept.unverified, "kept from the previous working set, but not re-read");
+    assert.equal(scopeLabel(kept), "Linked, not re-read from Jira");
+    assert.ok(state.executions.find(execution => execution.nodeId === "7").signals.some(signal => signal.kind === "jira_stale"));
+    await assert.rejects(wb.prepare({ nodeId: "7" }), /did not re-read/);
     assert.equal(state.error, null);
     assert.ok(state.ancestorWarnings.some(warning => /Linked work lookup failed: lookup outage/.test(warning)));
     gateway.lookupIssues = async () => { throw Object.assign(new Error("Jira connection lost"), { kind: "transient" }); };
@@ -288,6 +291,21 @@ test("a failed linked-work lookup keeps loaded linked items, and a connection fa
     assert.equal(state.error, "Jira connection lost");
     assert.equal(laterReads, 0, "no later read can clear the connection failure");
     assert.ok(state.issues.some(issue => issue.id === "7"));
+});
+
+test("a same-project parent linked while Jira is read becomes linked work, not context", async () => {
+    const { wb, gateway } = fixture();
+    gateway.issues = async () => ({ issues: [row("1", { parentKey: "DEMO-10" })], fetchedAt: "now" });
+    gateway.ancestors = async () => {
+        // The link lands after the linked-work lookup has read the store.
+        await wb.commit(data => { data.links[wb.selectedScope("10")] = { sessions: [{ id: "session-10" }], prs: [] }; });
+        return { issues: [row("10", { key: "DEMO-10", level: 1, contextOnly: true })], warnings: [] };
+    };
+    const state = await wb.refresh();
+    const parent = state.issues.find(issue => issue.id === "10");
+    assert.equal(parent.contextOnly, undefined);
+    assert.equal(parent.tracked, true);
+    assert.ok(state.executions.some(execution => execution.nodeId === "10"));
 });
 
 test("an issue linked while Apply reads Jira stays in the new working set", async () => {

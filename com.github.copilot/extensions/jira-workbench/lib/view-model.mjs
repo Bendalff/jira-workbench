@@ -7,7 +7,7 @@ export const humanize = value => String(value || "unknown").replace(/[_-]/g, " "
 // Why a loaded row is not ordinary scope work; shown as a badge and in the row's accessible name.
 export function scopeLabel(item) {
     if (item.contextOnly) return item.missing ? "Missing / restricted" : "Context only";
-    return item.tracked ? "Linked, outside scope" : "";
+    return item.tracked ? item.unverified ? "Linked, not re-read from Jira" : "Linked, outside scope" : "";
 }
 
 export function workingSetSummary({ issues = [], page = {}, fetchedAt, cached }) {

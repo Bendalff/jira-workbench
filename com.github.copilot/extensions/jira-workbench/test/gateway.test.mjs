@@ -55,11 +55,13 @@ test("loads one bounded issue page and continues only when requested, including 
     assert.equal(result.issues.length, 1);
     assert.equal(result.nextPageToken, "next");
     assert.equal(calls.filter(call => !/sprint/i.test(call.args.jql)).length, 1);
-    const next = await gateway.issues("site-a", "42", { cursor: result.nextPageToken });
+    // Load more reads fresh, which bypasses the short-lived read cache.
+    const next = await gateway.issues("site-a", "42", { cursor: result.nextPageToken, fresh: true });
     assert.equal(next.issues[0].key, "DEMO-2");
     assert.equal(next.nextPageToken, null);
     const pages = calls.filter(call => !/sprint/i.test(call.args.jql));
     assert.equal(pages.length, 2);
+    assert.equal(calls.length - pages.length, 1, "a continuation page does not repeat the sprint probe");
     assert.match(pages[0].args.jql, /^project = 42 /);
     assert.equal(pages[1].args.nextPageToken, "next");
     assert.ok(pages[0].args.fields.includes("parent"));
