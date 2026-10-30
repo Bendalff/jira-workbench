@@ -60,7 +60,10 @@ session; there is no automatic child fan-out.
 
 ### Working scopes and bounded reads
 
-The default server scope is the selected project, ordered by key. **Scope**
+The default server scope is the selected project, ordered by most recently
+updated (`updated DESC, key DESC`); JQL without its own `ORDER BY` and saved
+filters use the same order. The tree sorts its own display, so the order only
+decides which items arrive on the first page. **Scope**
 also accepts JQL or a numeric saved Jira filter ID. JQL and filter scopes are
 intersected with the selected project; **Apply** validates the expression and
 stages its first page before persisting the definition in the project's
@@ -76,6 +79,15 @@ continuation. **Load more** appends one page; it never crawls to a size cap.
 Page failures preserve the loaded set and cursor, with an explicit error.
 **Refresh** replaces the working set with a new first page only after a
 successful read. Cached data stays marked as cached until revalidated.
+
+Every first-page read (select, Apply, Refresh) also reads tracked work by ID:
+issues in the selected project with a durable session or PR link, or a queued,
+expired or failed launch request, that the page did not return. The lookup is
+project-constrained, read-only and capped at 300 IDs, pending requests first.
+Tracked issues are actionable work in the execution queue and hierarchy,
+labeled **Linked, outside scope**, and excluded from scope counts; a later page
+that returns one promotes it to a scope item. Lookup failures, unavailable
+identities and the limit are reported as warnings, never as an empty queue.
 
 Referenced ancestor keys or IDs are deduplicated and read in batches of 50
 without the working scope's constraints, recursively up to 32 levels.
@@ -588,7 +600,8 @@ verification artifacts.
   session links retain their original repository metadata.
 - Each page is bounded, but explicitly loading many pages still grows the
   panel's in-memory working set. Jira must return a usable continuation when
-  more results remain. Session previews require at most 500 loaded descendants;
+  more results remain. Pages ordered by `updated` can shift while you page, so
+  an item updated mid-paging appears only after **Refresh**. Session previews require at most 500 loaded descendants;
   they do not imply that every child has been loaded.
 - Launches are agent-mediated and need the canvas-owning session to process them.
   If creation fails, record the error with `fail_request`; never retry an

@@ -1,4 +1,6 @@
 export const DEFAULT_SCOPE = Object.freeze({ kind: "project", value: "" });
+// The first bounded page should be current work, not the oldest keys; the tree sorts its own display order.
+export const DEFAULT_ORDER = "updated DESC, key DESC";
 
 export function validateScope(input = DEFAULT_SCOPE) {
     if (!input || !["project", "jql", "filter"].includes(input.kind))
@@ -24,14 +26,14 @@ function splitOrder(jql) {
         if (order) return [jql.slice(0, index).trim(), jql.slice(index + order[0].length).trim()];
     }
     if (quote || depth) throw new Error("JQL has an unclosed quote or parenthesis.");
-    return [jql, "key ASC"];
+    return [jql, DEFAULT_ORDER];
 }
 
 export function scopeJql(projectId, definition = DEFAULT_SCOPE) {
     if (!/^\d+$/.test(projectId)) throw new Error("A numeric Jira project ID is required.");
     const scope = validateScope(definition);
-    if (scope.kind === "project") return `project = ${projectId} ORDER BY key ASC`;
-    const [clause, order] = scope.kind === "filter" ? [`filter = ${scope.value}`, "key ASC"] : splitOrder(scope.value);
+    if (scope.kind === "project") return `project = ${projectId} ORDER BY ${DEFAULT_ORDER}`;
+    const [clause, order] = scope.kind === "filter" ? [`filter = ${scope.value}`, DEFAULT_ORDER] : splitOrder(scope.value);
     if (!clause || !order) throw new Error("JQL needs an expression and a nonempty sort clause.");
     return `project = ${projectId} AND (${clause}) ORDER BY ${order}`;
 }

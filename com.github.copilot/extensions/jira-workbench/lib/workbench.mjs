@@ -1,4 +1,4 @@
-import { buildTree, projectStatuses, scopeKey } from "./model.mjs";
+import { buildTree, projectStatuses, requestStatus, scopeKey } from "./model.mjs";
 import { deriveExecution } from "./execution.mjs";
 import { Launches } from "./launches.mjs";
 import { objects, settle, standaloneError } from "./runtime.mjs";
@@ -407,10 +407,38 @@ export class Workbench {
     }
     async readWorkingSet(cloudId, projectId, definition, fresh) {
         const read = await this.jira(options => this.gateway.issues(cloudId, projectId, { ...options, scope: definition }), fresh);
-        const context = await this.withAncestors(cloudId, read.issues, [], { fresh });
+        const tracked = await this.trackedWork(cloudId, projectId, read.issues, fresh);
+        const context = await this.withAncestors(cloudId, mergeIssues(tracked.issues, read.issues), [], { fresh });
         const statuses = !context.connectionError && this.gateway.statuses
             ? await this.jira(options => this.gateway.statuses(cloudId, projectId, options), fresh).catch(() => null) : null;
-        return { ...read, ...context, loaded: read.issues.length, statuses };
+        return { ...read, ...context, warnings: [...tracked.warnings, ...context.warnings], loaded: read.issues.length, statuses };
+    }
+    // Issues with linked sessions or PRs, or an unresolved launch request, stay in the execution queue whatever
+    // scope or page is loaded: a pending request must never vanish because its issue is off the current page.
+    async trackedWork(cloudId, projectId, loaded, fresh) {
+        if (!this.gateway.lookupIssues) return { issues: [], warnings: [] };
+        const data = await this.store.read();
+        const prefix = `${[cloudId, projectId].map(encodeURIComponent).join("/")}/`;
+        const ids = new Set();
+        for (const request of Object.values(data.requests))
+            if (request.scope?.startsWith(prefix) && /^\d+$/.test(request.nodeId) && ["queued", "expired", "failed"].includes(requestStatus(request)))
+                ids.add(request.nodeId);
+        for (const [key, link] of Object.entries(data.links)) {
+            const id = key.startsWith(prefix) ? key.slice(prefix.length) : "";
+            if (/^\d+$/.test(id) && (link.sessions?.length || link.prs?.length)) ids.add(id);
+        }
+        const have = new Set(loaded.map(issue => issue.id));
+        const missing = [...ids].filter(id => !have.has(id)), wanted = missing.slice(0, 300);
+        if (!wanted.length) return { issues: [], warnings: [] };
+        const warnings = missing.length > wanted.length ? [`${missing.length - wanted.length} linked items exceed the 300-item limit and are not loaded.`] : [];
+        try {
+            const issues = await this.jira(options => this.gateway.lookupIssues(cloudId, projectId, wanted, options), fresh);
+            const found = new Set(issues.map(issue => issue.id)), unavailable = wanted.filter(id => !found.has(id)).length;
+            if (unavailable) warnings.push(`${unavailable} linked items are missing, restricted or moved and are not shown.`);
+            return { issues: issues.map(issue => ({ ...issue, tracked: true })), warnings };
+        } catch (error) {
+            return { issues: [], warnings: [...warnings, `Linked work lookup failed: ${error.message}`] };
+        }
     }
     installWorkingSet(result) {
         this.issues = result.issues;
@@ -508,7 +536,7 @@ export class Workbench {
                 this.issues = mergeIssues(this.issues, result.issues);
                 const ids = [...new Set([...(before?.ids || []), ...result.loadedIds])];
                 const page = { nextPageToken: result.nextPageToken || null, total: result.total ?? before?.total ?? null,
-                    loaded: parent ? ids.length : this.issues.filter(issue => !issue.contextOnly).length,
+                    loaded: parent ? ids.length : this.issues.filter(issue => !issue.contextOnly && !issue.tracked).length,
                     ids: parent ? ids : [], cursors: [...(before?.cursors || []), ...(cursor ? [cursor] : [])] };
                 if (parent) this.childPages = { ...this.childPages, [parent.id]: page };
                 else this.page = page;

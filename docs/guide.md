@@ -112,7 +112,8 @@ Fill them in from left to right:
 
 1. **Jira site**: your Atlassian site.
 2. **Project**: any Jira project you can browse. No active sprint is required;
-   the canvas loads its first 100 matching items, not the entire project.
+   the canvas loads the 100 most recently updated matching items first, not
+   the entire project.
 3. **Copilot repository**: the repository Copilot should work in.
 
 > [!IMPORTANT]
@@ -137,11 +138,21 @@ If another Apply or a project switch arrives during a successful scope's
 save, it waits until that save is reflected in the panel. A later failed
 scope read retains the last committed scope.
 
-**Load more** requests the next page from Jira. The summary shows how many
+**Load more** requests the next page from Jira. Pages are ordered by most
+recently updated unless your JQL has its own `ORDER BY`. An item updated while
+you page through results can move to an earlier page; **Refresh** picks it up.
+The summary shows how many
 matching items are loaded, any available matching total, and whether more
 pages remain. A failed next page leaves the useful loaded data and cursor
 intact and reports the error so you can retry. **Refresh** starts again from
 the first page of the applied scope.
+
+Work you already started is never hidden by the scope. Issues in the selected
+project with a linked session or pull request, or a queued, expired or failed
+launch request, are read by ID on every first-page read (up to 300) and stay in
+**Execution** and **Hierarchy**. They are labeled **Linked, outside scope** and
+are not counted as scope matches. Linked issues that are missing, restricted or
+over the limit are reported in the warning banner.
 
 **Search loaded items**, status and sprint controls only filter the loaded
 copy. They do not change the server scope or discover unloaded matches.

@@ -26,10 +26,11 @@ function fixture() {
 }
 
 test("scope builds project-constrained server JQL without corrupting quoted ORDER BY", () => {
-    assert.equal(scopeJql("42"), "project = 42 ORDER BY key ASC");
-    assert.equal(scopeJql("42", { kind: "filter", value: "123" }), "project = 42 AND (filter = 123) ORDER BY key ASC");
+    assert.equal(scopeJql("42"), "project = 42 ORDER BY updated DESC, key DESC");
+    assert.equal(scopeJql("42", { kind: "filter", value: "123" }), "project = 42 AND (filter = 123) ORDER BY updated DESC, key DESC");
     assert.equal(scopeJql("42", { kind: "jql", value: 'text ~ "ORDER BY" ORDER BY updated DESC, key ASC' }), 'project = 42 AND (text ~ "ORDER BY") ORDER BY updated DESC, key ASC');
-    assert.equal(scopeJql("42", { kind: "jql", value: "status = Open OR status = Closed" }), "project = 42 AND (status = Open OR status = Closed) ORDER BY key ASC");
+    assert.equal(scopeJql("42", { kind: "jql", value: "status = Open OR status = Closed" }), "project = 42 AND (status = Open OR status = Closed) ORDER BY updated DESC, key DESC");
+    assert.equal(scopeJql("42", { kind: "jql", value: "status = Open ORDER BY key ASC" }), "project = 42 AND (status = Open) ORDER BY key ASC", "an explicit sort is kept");
     assert.throws(() => scopeJql("42 OR project = 43"), /numeric/);
     assert.throws(() => scopeJql("42", { kind: "jql", value: "status = Open) OR project = 43 OR (status = Closed" }), /unmatched/);
     assert.throws(() => scopeJql("42", { kind: "jql", value: 'summary ~ "unclosed' }), /unclosed/);
@@ -218,6 +219,51 @@ test("loaded counts, paging and child-completeness labels do not imply complete 
     assert.equal(childLoadState(row("1"), { loaded: 2, nextPageToken: "next" }), "Load more children (2 read)");
     assert.equal(childLoadState(row("1"), { loaded: 2, nextPageToken: null }), "All 2 immediate children read");
     assert.equal(childLoadState(row("1", { level: -1 })), null);
+});
+
+test("linked and pending work stays in the execution queue when it is outside the loaded scope page", async () => {
+    const { wb, gateway, store } = fixture();
+    const asked = [];
+    gateway.lookupIssues = async (cloudId, projectId, ids) => {
+        asked.push({ cloudId, projectId, ids });
+        return ids.filter(id => id !== "9").map(id => row(id));
+    };
+    await store.update(data => {
+        data.requests.queued = { requestId: "queued", scope: wb.selectedScope("8"), nodeId: "8", status: "queued", at: new Date().toISOString() };
+        data.requests.cleared = { requestId: "cleared", scope: wb.selectedScope("6"), nodeId: "6", status: "cancelled", at: new Date().toISOString() };
+        data.links[wb.selectedScope("7")] = { sessions: [{ id: "session-7" }], prs: [] };
+        data.links[wb.selectedScope("1")] = { sessions: [{ id: "session-1" }], prs: [] };
+        data.links[wb.selectedScope("5")] = { sessions: [], prs: [] };
+        data.links["demo-site/43/4"] = { sessions: [{ id: "other-project" }], prs: [] };
+        data.links[wb.selectedScope("9")] = { sessions: [], prs: [{ repo: "example/demo", number: 1 }] };
+    });
+    const state = await wb.refresh();
+    assert.deepEqual(asked, [{ cloudId: "demo-site", projectId: "42", ids: ["8", "7", "9"] }], "pending requests first; loaded, empty, cleared and other-project entries are not read");
+    assert.deepEqual(state.executions.map(execution => execution.nodeId).sort(), ["1", "7", "8"]);
+    assert.equal(state.issues.find(issue => issue.id === "7").tracked, true);
+    assert.match(workingSetSummary(state), /1 scope items loaded; 1 context items; 2 linked items outside the loaded pages\./);
+    assert.ok(state.ancestorWarnings.some(warning => /1 linked items are missing, restricted or moved/.test(warning)));
+
+    gateway.issues = async () => ({ issues: [row("7")], nextPageToken: null, fetchedAt: "2026-01-01T00:01:00Z" });
+    const more = await wb.loadMore();
+    assert.equal(more.issues.find(issue => issue.id === "7").tracked, undefined, "a scope page promotes linked work to a scope item");
+    assert.equal(more.page.loaded, 2);
+    assert.match(workingSetSummary(more), /2 scope items loaded; 1 context items; 1 linked items outside the loaded pages\./);
+});
+
+test("linked work lookup failures and its 300-item limit are reported without hiding the scope page", async () => {
+    const { wb, gateway, store } = fixture();
+    let asked;
+    gateway.lookupIssues = async (cloudId, projectId, ids) => { asked = ids; throw new Error("lookup outage"); };
+    await store.update(data => {
+        for (let id = 100; id < 405; id++) data.links[wb.selectedScope(String(id))] = { sessions: [{ id: `session-${id}` }], prs: [] };
+    });
+    const state = await wb.refresh();
+    assert.equal(asked.length, 300);
+    assert.ok(state.issues.some(issue => issue.id === "1"));
+    assert.equal(state.error, null);
+    assert.ok(state.ancestorWarnings.some(warning => /5 linked items exceed the 300-item limit/.test(warning)));
+    assert.ok(state.ancestorWarnings.some(warning => /Linked work lookup failed: lookup outage/.test(warning)));
 });
 
 test("execution evidence reads are bounded to the visible/selected nodes and captured project identity", async () => {

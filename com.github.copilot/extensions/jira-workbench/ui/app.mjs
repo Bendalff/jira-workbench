@@ -830,6 +830,7 @@ function itemName(item, node, compact = false) {
     meta.append(el("span", (item.type || "Work").slice(0, 1), `type-icon ${item.level > 0 ? "epic" : item.level < 0 ? "subtask" : "story"}`), el("span", item.key, "issue-key"));
     if (item.level > 0 || item.id === "project") meta.append(el("small", item.id === "project" ? "Project scope" : item.type, "muted"));
     if (item.contextOnly) meta.append(badge(item.missing ? "Missing / restricted" : "Context only"));
+    else if (item.tracked) meta.append(badge("Linked, outside scope"));
     const summary = el("span", item.summary, "summary");
     if (compact) {
         const line = el("div", null, "execution-title");
@@ -1365,7 +1366,10 @@ $("apply-scope").addEventListener("click", async () => {
         if (epoch === scopeEpoch) connectionMessage("apply-scope", `Scope was not applied: ${error.message}`);
     } finally {
         if (epoch === scopeEpoch) {
-            selecting = false; render({ force: true }); queueVisibleItems();
+            selecting = false;
+            // A view change made just before Apply could not be saved while it ran.
+            savePreferences();
+            render({ force: true }); queueVisibleItems();
             if (restoreFocus && document.activeElement === document.body) $("apply-scope").focus({ preventScroll: true });
         }
     }

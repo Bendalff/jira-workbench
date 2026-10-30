@@ -137,7 +137,8 @@ try {
     // Superseding Apply clears its status, without clearing the project's saved selection/collapse state.
     await page.locator("#view-hierarchy").click();
     await page.getByRole("treeitem", { name: /DEMO-2 Scoped task/ }).click();
-    const savedView = page.waitForResponse(response => response.url().endsWith("/api/preferences") && response.ok());
+    const savedView = page.waitForResponse(response => response.url().endsWith("/api/preferences") && response.ok()
+        && response.request().postDataJSON().preferences.collapsed.includes(feature.id));
     await featureRow.getByRole("button", { name: "Collapse PARENT-101", exact: true }).click();
     await savedView;
     const heldApply = deferred(), releaseApply = deferred();
@@ -199,7 +200,11 @@ try {
     await page.reload();
     await page.waitForFunction(() => document.getElementById("scope-value").value === "456");
     await page.locator("#view-hierarchy").click();
-    await featureRow.getByRole("button", { name: "Expand PARENT-101", exact: true }).click();
+    // Expanding PARENT-101 at the previous step may or may not have been saved before this reload; only visibility matters.
+    await featureRow.getByRole("button", { name: /^(Expand|Collapse) PARENT-101$/ }).waitFor();
+    const expandFeature = featureRow.getByRole("button", { name: "Expand PARENT-101", exact: true });
+    if (await expandFeature.count()) await expandFeature.click();
+    await page.getByRole("treeitem", { name: /DEMO-2 Scoped task/ }).waitFor();
     await page.getByRole("treeitem", { name: /PORT-102 Portfolio context/ }).click();
     await page.waitForRequest(request => request.url().endsWith("/api/visible") && request.postDataJSON().nodeIds.includes(task.id));
     const bEntered = deferred(), releaseB = deferred();
@@ -223,9 +228,22 @@ try {
     releaseB.resolve();
     await page.unroute("**/api/visible", { behavior: "wait" });
     assert.ok(workbench.evidenceNodes.has(task.id), "returning to A supersedes in-flight B");
+
+    // A pending request on an issue outside the loaded pages stays visible after Refresh, labeled as linked work.
+    await store.update(data => {
+        data.requests["linked-request"] = { requestId: "linked-request", kind: "launch", scope: scope.replace(/project$/, "3"), nodeId: "3",
+            issueKey: "DEMO-3", mode: "plan", status: "queued", at: new Date().toISOString() };
+    });
+    gateway.lookupIssues = async (site, project, ids) => issues.filter(issue => ids.includes(issue.id));
+    await page.locator("#refresh").click();
+    const linkedRow = page.getByRole("treeitem", { name: /DEMO-3 Running with a PR/ });
+    await linkedRow.waitFor();
+    assert.match(await linkedRow.innerText(), /Linked, outside scope/);
+    await page.waitForFunction(() => document.getElementById("scope-summary").textContent.includes("1 linked items outside the loaded pages"));
+    assert.ok((await workbench.snapshot()).executions.some(execution => execution.nodeId === "3"), "pending work stays in the execution queue");
     await page.screenshot({ path: screenshotPath("scoped-loading.png") });
     assert.deepEqual(errors, []);
-    console.log("PASS: transactional scopes, bounded pages/retry, cross-project hierarchy and trace isolation, lazy children, stale/superseded page outcomes, versioned same-scope and A-B-A visibility, restored per-project selection/collapse and drafts, accurate failed/superseded Apply status, stable live summaries, and keyboard focus. All services were synthetic; no Jira writes.");
+    console.log("PASS: transactional scopes, bounded pages/retry, cross-project hierarchy and trace isolation, lazy children, stale/superseded page outcomes, versioned same-scope and A-B-A visibility, restored per-project selection/collapse and drafts, accurate failed/superseded Apply status, stable live summaries, linked work outside the loaded pages, and keyboard focus. All services were synthetic; no Jira writes.");
 } finally {
     await browser.close();
     await server.close();
